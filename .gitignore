@@ -1,0 +1,17 @@
+# Claude Code project notes (local only)
+CLAUDE.md
+.claude/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Backups
+*.bak

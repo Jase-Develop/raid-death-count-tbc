@@ -1,0 +1,8 @@
+## Interface: 20506
+## Title: Raid Death Count
+## Notes: A lean HUD that tracks and syncs per-player death counts in a raid (TBC 2.5.6)
+## Version: 0.1
+## SavedVariables: RaidDeathCountDB
+
+RaidDeathCount.lua
+RaidDeathCount_UI.lua
