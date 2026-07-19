@@ -15,3 +15,6 @@ desktop.ini
 
 # Backups
 *.bak
+
+# graphify knowledge graph output (local only)
+graphify-out/
