@@ -70,14 +70,18 @@ local function ResolveRaidID()
     local iname, itype, _, _, _, _, _, mapID = GetInstanceInfo()
     if itype ~= "raid" then return nil end
     local lockoutID = FindLockoutID(iname)
-    if lockoutID and lockoutID ~= 0 then return "lock:" .. lockoutID, iname end
-    return "map:" .. tostring(mapID), iname   -- fresh raid, not yet saved
+    if lockoutID and lockoutID ~= 0 then return "lock:" .. lockoutID, iname, mapID end
+    -- No lockout yet: fall back to mapID. But a nil/0 mapID is a transient read (blank instance info for a
+    -- tick, seen mid-instance on phase changes) - return nil so UpdateRaidID keeps the current id rather
+    -- than minting a bogus "map:nil" session that both looks like a reset and breaks the map->lock merge.
+    if not mapID or mapID == 0 then return nil end
+    return "map:" .. tostring(mapID), iname, mapID   -- fresh raid, not yet saved
 end
 
 -- ── Sessions / data ───────────────────────────────────────────────────────────
 
-local function EnsureSession(rid, iname)
-    DB.sessions[rid] = DB.sessions[rid] or { started = time(), instance = iname, players = {} }
+local function EnsureSession(rid, iname, mapID)
+    DB.sessions[rid] = DB.sessions[rid] or { started = time(), instance = iname, mapID = mapID, players = {} }
     return DB.sessions[rid]
 end
 
@@ -290,29 +294,53 @@ local function MergeSession(from, to)
 end
 
 -- Re-resolve the active raid; switch (fresh session + resync) only on a genuinely different raid.
+-- Is `s` the SAME physical raid we are standing in right now? Match on the stable instance mapID first
+-- (sessions written by newer code carry it), falling back to the instance name for older sessions. Used
+-- to tell a transient key change (same raid) from a genuinely different raid.
+local function SameInstance(s, iname, mapID)
+    if not s then return false end
+    if s.mapID and mapID and s.mapID == mapID then return true end
+    return s.instance ~= nil and s.instance ~= "" and s.instance == iname
+end
+
 local function UpdateRaidID()
-    local rid, iname = ResolveRaidID()
-    if rid and rid ~= DB.currentRaidID then
+    local rid, iname, mapID = ResolveRaidID()
+    if not rid then return end                       -- not in a raid: keep current (sticky)
+
+    if rid ~= DB.currentRaidID then
         local oldID = DB.currentRaidID
+        local oldS = oldID and DB.sessions[oldID]
+
+        -- Do NOT demote a positively resolved lock: back to a map: fallback for the SAME instance. A
+        -- map: result while standing in the instance we already track means the saved-instance cache was
+        -- momentarily empty this tick (it lags after some events), not that we changed raids. Switching
+        -- would land on a fresh zero session and look like a reset, so keep the lock: id.
+        if rid:match("^map:") and oldID and oldID:match("^lock:") and SameInstance(oldS, iname, mapID) then
+            return
+        end
+
         DB.currentRaidID = rid
-        local newS = EnsureSession(rid, iname)
+        local newS = EnsureSession(rid, iname, mapID)
         -- Map->lock upgrade for the raid we're standing in: the temporary "map:<id>" fallback becomes the
         -- real server lockout key the moment we get saved (first boss). That is the SAME raid, not a new
-        -- one, so carry its counts forward and drop the stale map session instead of resetting to zero.
-        if oldID and oldID:match("^map:") and rid:match("^lock:") then
-            local oldS = DB.sessions[oldID]
-            if oldS and oldS.instance == iname then
-                MergeSession(oldS, newS)
-                DB.sessions[oldID] = nil
-            end
+        -- one, so carry its counts forward (by MAX) and drop the stale map session instead of resetting to
+        -- zero. Keyed on mapID (robust) rather than an exact name-string match, which could go stale/blank
+        -- and silently skip the merge (dropping the run's counts). Restricted to map: -> lock: so a
+        -- genuinely new lockout (next-week reset: lock: -> lock:) still starts clean.
+        if oldID and oldID:match("^map:") and rid:match("^lock:") and SameInstance(oldS, iname, mapID) then
+            MergeSession(oldS, newS)
+            DB.sessions[oldID] = nil
         end
         wipe(prevDead)               -- new raid context: drop stale baselines (re-baselined next sweep)
         PruneSessions(10)
         RequestResync()
         RefreshHUD()
-    elseif rid and iname then
+    elseif iname then
         local s = ActiveSession()
-        if s and not s.instance then s.instance = iname end
+        if s then
+            if not s.instance or s.instance == "" then s.instance = iname end
+            if not s.mapID then s.mapID = mapID end   -- backfill for sessions written by older code
+        end
     end
 end
 
@@ -436,6 +464,29 @@ function RDC.DebugDump()
     for _, e in ipairs(RDC.GetSnapshot()) do
         print(("  %s (%s): %d"):format(e.name, tostring(e.class), e.deaths))
     end
+    -- Every stored session, so a stranded/orphaned raidID's counts are visible (not just the active one).
+    print("|cff88bbffRDC|r sessions in DB:")
+    for id, s in pairs(DB and DB.sessions or {}) do
+        local total, np = 0, 0
+        for _, p in pairs(s.players or {}) do total = total + (p.deaths or 0); np = np + 1 end
+        print(("  <%s> instance=%s mapID=%s players=%d totalDeaths=%d%s"):format(
+            tostring(id), tostring(s.instance), tostring(s.mapID), np, total,
+            id == DB.currentRaidID and "  <== ACTIVE" or ""))
+    end
+end
+
+-- Recovery: MAX-merge a stranded session's counts into the active one, then drop the source. Manual, for
+-- reclaiming counts orphaned by an old bug: /run RaidDeathCount.DebugRecover("map:550")
+function RDC.DebugRecover(fromID)
+    if not DB or not DB.currentRaidID then print("|cff88bbffRDC|r no active raid"); return end
+    local from = DB.sessions[fromID]
+    local to = DB.sessions[DB.currentRaidID]
+    if not from then print("|cff88bbffRDC|r no session " .. tostring(fromID)); return end
+    if not to or from == to then print("|cff88bbffRDC|r nothing to merge"); return end
+    MergeSession(from, to)
+    DB.sessions[fromID] = nil
+    RefreshHUD()
+    print(("|cff88bbffRDC|r merged %s into active %s"):format(tostring(fromID), tostring(DB.currentRaidID)))
 end
 
 -- ── Slash command ─────────────────────────────────────────────────────────────
