@@ -144,6 +144,10 @@ grip:SetScript("OnMouseDown", function()
 end)
 grip:SetScript("OnMouseUp", function() hud:StopMovingOrSizing(); SavePlacement(); RDC.RefreshHUD() end)
 
+-- Reflow live while sizing (bar widths + visible row count both derive from the body size), so the
+-- rows track the drag instead of snapping into place only when the grip is released.
+hud:SetScript("OnSizeChanged", function() if RDC.RefreshHUD then RDC.RefreshHUD() end end)
+
 -- ── Body / rows ───────────────────────────────────────────────────────────────
 local body = CreateFrame("Frame", nil, hud)
 body:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -PAD)
@@ -277,4 +281,144 @@ function RDC.InitHUD()
     if db.shown == nil then db.shown = true end   -- visible by default (Details-style)
     if db.shown then hud:Show() else hud:Hide() end
     RDC.RefreshHUD()
+end
+
+-- ── Minimap button ──────────────────────────────────────────────────────────────
+-- Hand-rolled draggable minimap button (no LibDBIcon/LibStub), borrowed from WarlockQol. Left-click
+-- toggles the HUD; drag slides it around the ring. Angle + hidden state persist in RaidDeathCountDB.minimap.
+-- Created here but positioned/shown on PLAYER_LOGIN via RDC.InitMinimap (DB is ready by then).
+do
+    local DEFAULT_ANGLE = 200   -- degrees; lower-left, clear of the zoom +/- buttons
+
+    -- Minimap SHAPE support so the button sits right on square minimaps (ElvUI) too, without LibDBIcon.
+    -- Skinning addons expose GetMinimapShape(); each entry flags whether each QUADRANT is rounded (true)
+    -- or squared (false), ordered {BR, BL, TR, TL}. Absent -> ROUND. Same public table LibDBIcon uses.
+    local MINIMAP_SHAPES = {
+        ["ROUND"]                 = { true,  true,  true,  true  },
+        ["SQUARE"]                = { false, false, false, false },
+        ["CORNER-TOPLEFT"]        = { false, false, false, true  },
+        ["CORNER-TOPRIGHT"]       = { false, false, true,  false },
+        ["CORNER-BOTTOMLEFT"]     = { false, true,  false, false },
+        ["CORNER-BOTTOMRIGHT"]    = { true,  false, false, false },
+        ["SIDE-LEFT"]             = { false, true,  false, true  },
+        ["SIDE-RIGHT"]            = { true,  false, true,  false },
+        ["SIDE-TOP"]              = { false, false, true,  true  },
+        ["SIDE-BOTTOM"]           = { true,  true,  false, false },
+        ["TRICORNER-TOPLEFT"]     = { false, true,  true,  true  },
+        ["TRICORNER-TOPRIGHT"]    = { true,  false, true,  true  },
+        ["TRICORNER-BOTTOMLEFT"]  = { true,  true,  false, true  },
+        ["TRICORNER-BOTTOMRIGHT"] = { true,  true,  true,  false },
+    }
+
+    local function MMDB() return RaidDeathCountDB and RaidDeathCountDB.minimap end
+
+    local btn = CreateFrame("Button", "RaidDeathCount_MinimapButton", Minimap)
+    btn:SetSize(31, 31)
+    btn:SetFrameStrata("MEDIUM")
+    btn:SetFrameLevel(8)
+    btn:RegisterForClicks("LeftButtonUp")
+    btn:RegisterForDrag("LeftButton")
+
+    -- Skull icon, trimmed of its default border.
+    local icon = btn:CreateTexture(nil, "ARTWORK")
+    icon:SetSize(19, 19)
+    icon:SetPoint("TOPLEFT", 7, -6)
+    icon:SetTexture("Interface\\Icons\\INV_Misc_Bone_HumanSkull_01")
+    icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+    -- Classic round bezel so it matches every other minimap button.
+    local border = btn:CreateTexture(nil, "OVERLAY")
+    border:SetSize(53, 53)
+    border:SetPoint("TOPLEFT")
+    border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+
+    -- Place the button from the current angle, hugging the minimap edge (on the circle for a rounded
+    -- quadrant, clamped to the square edge otherwise). w/h from the live minimap size (+5px) so it tracks resizes.
+    local angle = DEFAULT_ANGLE
+    local function UpdatePosition()
+        local a = math.rad(angle)
+        local x, y = math.cos(a), math.sin(a)
+        local q = 1
+        if x < 0 then q = q + 1 end
+        if y > 0 then q = q + 2 end
+        local shape = (GetMinimapShape and GetMinimapShape()) or "ROUND"
+        local quad  = MINIMAP_SHAPES[shape] or MINIMAP_SHAPES["ROUND"]
+        local w = (Minimap:GetWidth()  / 2) + 5
+        local h = (Minimap:GetHeight() / 2) + 5
+        if quad[q] then
+            x, y = x * w, y * h                       -- rounded quadrant: sit on the ellipse
+        else
+            local dw = math.sqrt(2 * w * w) - 10      -- squared quadrant: clamp the ray to the edge
+            local dh = math.sqrt(2 * h * h) - 10
+            x = math.max(-w, math.min(x * dw, w))
+            y = math.max(-h, math.min(y * dh, h))
+        end
+        btn:ClearAllPoints()
+        btn:SetPoint("CENTER", Minimap, "CENTER", x, y)
+    end
+
+    -- Reposition if the minimap is resized (ElvUI etc. can change its size after login).
+    Minimap:HookScript("OnSizeChanged", function() UpdatePosition() end)
+
+    -- Drag: turn the cursor's position (relative to the minimap centre) back into an angle.
+    local dragging = false
+    local function OnDragUpdate()
+        local mx, my = Minimap:GetCenter()
+        local scale  = Minimap:GetEffectiveScale()
+        local cx, cy = GetCursorPosition()
+        cx, cy = cx / scale, cy / scale
+        angle = math.deg(math.atan2(cy - my, cx - mx)) % 360
+        UpdatePosition()
+    end
+    btn:SetScript("OnDragStart", function(self)
+        dragging = true
+        GameTooltip:Hide()
+        self:SetScript("OnUpdate", OnDragUpdate)
+    end)
+    btn:SetScript("OnDragStop", function(self)
+        dragging = false
+        self:SetScript("OnUpdate", nil)
+        local db = MMDB()
+        if db then db.angle = angle end   -- persist the new position
+    end)
+
+    -- Left-click toggles the HUD (open if closed, close if open), same as /rdc.
+    btn:SetScript("OnClick", function() RDC.ToggleHUD() end)
+
+    btn:SetScript("OnEnter", function(self)
+        if dragging then return end
+        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+        local ver = RDC.GetVersion and RDC.GetVersion() or "?"
+        GameTooltip:SetText("Raid Death Count  |cff888888v" .. ver .. "|r", THEME.accent[1], THEME.accent[2], THEME.accent[3])
+        GameTooltip:AddLine("Click to toggle the HUD.", 0.8, 0.8, 0.8, true)
+        GameTooltip:AddLine("Drag to move around the minimap.", 0.8, 0.8, 0.8, true)
+        GameTooltip:Show()
+    end)
+    btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    btn:Hide()   -- shown by InitMinimap once the saved hidden flag is known
+
+    -- Public API + login init. Angle + hidden state live in RaidDeathCountDB.minimap; nil = shown, nil
+    -- angle = DEFAULT_ANGLE.
+    function RDC.IsMinimapHidden()
+        local db = MMDB()
+        return (db and db.hidden) and true or false
+    end
+    function RDC.SetMinimapHidden(hide)
+        hide = hide and true or false
+        local db = MMDB()
+        if db then db.hidden = hide end
+        if hide then btn:Hide() else btn:Show() end
+    end
+    function RDC.ToggleMinimap()
+        RDC.SetMinimapHidden(not RDC.IsMinimapHidden())
+        print("|cff88bbffRaidDeathCount|r minimap button " .. (RDC.IsMinimapHidden() and "hidden." or "shown."))
+    end
+    -- Called from the core's PLAYER_LOGIN once the DB is resolved.
+    function RDC.InitMinimap()
+        local db = MMDB()
+        if db and db.angle then angle = db.angle end
+        UpdatePosition()
+        if db and db.hidden then btn:Hide() else btn:Show() end
+    end
 end

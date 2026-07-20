@@ -18,6 +18,13 @@ local lastSyncReply = 0       -- time() of our last full-state reply (throttle)
 
 -- ── Small helpers ─────────────────────────────────────────────────────────────
 
+-- Addon version, read from the .toc "## Version" (single source of truth). Modern C_AddOns namespace
+-- with a fallback to the older global. Bump ## Version in the .toc before each commit to main.
+function RDC.GetVersion()
+    local getMeta = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
+    return (getMeta and getMeta(ADDON_NAME, "Version")) or "?"
+end
+
 -- "Name-Realm" (or plain "Name" same-realm) for a unit; the shared key every observer agrees on.
 local function FullName(unit)
     if not UnitExists(unit) then return nil end
@@ -128,13 +135,21 @@ end
 -- ── Snapshot (for HUD + reports) ──────────────────────────────────────────────
 
 -- Array of { name, class, deaths } with deaths > 0, sorted by deaths desc then name asc.
+-- When demo mode is on (RDC.demoData set), the snapshot mirrors that fake data instead of the session,
+-- so a UI pass can be done anywhere without a raid or real deaths.
 function RDC.GetSnapshot()
     local out = {}
-    local s = ActiveSession()
-    if s then
-        for name, p in pairs(s.players) do
-            if (p.deaths or 0) > 0 then
-                out[#out + 1] = { name = name, class = p.class, deaths = p.deaths }
+    if RDC.demoData then
+        for _, e in ipairs(RDC.demoData) do
+            out[#out + 1] = { name = e.name, class = e.class, deaths = e.deaths }
+        end
+    else
+        local s = ActiveSession()
+        if s then
+            for name, p in pairs(s.players) do
+                if (p.deaths or 0) > 0 then
+                    out[#out + 1] = { name = name, class = p.class, deaths = p.deaths }
+                end
             end
         end
     end
@@ -146,8 +161,29 @@ function RDC.GetSnapshot()
 end
 
 function RDC.GetInstanceName()
+    if RDC.demoData then return "Demo Preview" end
     local s = ActiveSession()
     return s and s.instance
+end
+
+-- ── Demo / UI-preview mode ─────────────────────────────────────────────────────
+-- Toggles fake data (5 rows, varied classes/counts) so the HUD can be styled outside a raid. Purely
+-- local: never touches the DB sessions and never broadcasts. Also force-shows the HUD so it's visible.
+function RDC.ToggleDemo()
+    if RDC.demoData then
+        RDC.demoData = nil
+        print("|cff88bbffRaidDeathCount|r demo data off.")
+    else
+        RDC.demoData = {
+            { name = "Grimtusk",   class = "WARRIOR", deaths = 12 },
+            { name = "Salandra",   class = "PRIEST",  deaths = 8  },
+            { name = "Backstabby", class = "ROGUE",   deaths = 5  },
+            { name = "Pewpewz",    class = "MAGE",     deaths = 3  },
+            { name = "Huntardo",   class = "HUNTER",   deaths = 1  },
+        }
+        print("|cff88bbffRaidDeathCount|r demo data on (5 sample rows).")
+    end
+    if RDC.SetHUDShown then RDC.SetHUDShown(true) elseif RDC.RefreshHUD then RDC.RefreshHUD() end
 end
 
 -- ── Comms ─────────────────────────────────────────────────────────────────────
@@ -243,13 +279,34 @@ end
 
 -- ── RaidID transitions ────────────────────────────────────────────────────────
 
+-- Copy one session's counts into another, merging by MAX per player (same rule sync uses).
+local function MergeSession(from, to)
+    for name, p in pairs(from.players) do
+        local q = to.players[name]
+        if not q then q = { class = p.class, deaths = 0 }; to.players[name] = q end
+        if p.class and p.class ~= "" then q.class = p.class end
+        if (p.deaths or 0) > (q.deaths or 0) then q.deaths = p.deaths end
+    end
+end
+
 -- Re-resolve the active raid; switch (fresh session + resync) only on a genuinely different raid.
 local function UpdateRaidID()
     local rid, iname = ResolveRaidID()
     if rid and rid ~= DB.currentRaidID then
+        local oldID = DB.currentRaidID
         DB.currentRaidID = rid
-        EnsureSession(rid, iname)
-        wipe(prevDead)               -- new raid: drop stale baselines
+        local newS = EnsureSession(rid, iname)
+        -- Map->lock upgrade for the raid we're standing in: the temporary "map:<id>" fallback becomes the
+        -- real server lockout key the moment we get saved (first boss). That is the SAME raid, not a new
+        -- one, so carry its counts forward and drop the stale map session instead of resetting to zero.
+        if oldID and oldID:match("^map:") and rid:match("^lock:") then
+            local oldS = DB.sessions[oldID]
+            if oldS and oldS.instance == iname then
+                MergeSession(oldS, newS)
+                DB.sessions[oldID] = nil
+            end
+        end
+        wipe(prevDead)               -- new raid context: drop stale baselines (re-baselined next sweep)
         PruneSessions(10)
         RequestResync()
         RefreshHUD()
@@ -327,6 +384,7 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         DB = RaidDeathCountDB
         DB.sessions = DB.sessions or {}
         DB.hud = DB.hud or {}
+        DB.minimap = DB.minimap or {}
         if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
             C_ChatInfo.RegisterAddonMessagePrefix(COMM_PREFIX)
         end
@@ -335,7 +393,9 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         RebuildWatched()
         UpdateRaidID()
         if RDC.InitHUD then RDC.InitHUD() end
+        if RDC.InitMinimap then RDC.InitMinimap() end
         RequestResync()
+        print(("|cff88bbffRaid Death Count|r v%s loaded. Enjoy!"):format(RDC.GetVersion()))
 
     elseif event == "PLAYER_ENTERING_WORLD" then
         RebuildWatched()
@@ -391,13 +451,22 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
         RDC.ResetCurrent()
     elseif cmd == "lock" then
         if RDC.ToggleLock then RDC.ToggleLock() end
+    elseif cmd == "minimap" then
+        if RDC.ToggleMinimap then RDC.ToggleMinimap() end
+    elseif cmd == "demo" then
+        if RDC.ToggleDemo then RDC.ToggleDemo() end
+    elseif cmd == "version" then
+        print("|cff88bbffRaidDeathCount|r v" .. RDC.GetVersion())
     elseif cmd == "" or cmd == "toggle" then
         if RDC.ToggleHUD then RDC.ToggleHUD() end
     else
-        print("|cff88bbffRaidDeathCount|r commands:")
+        print("|cff88bbffRaidDeathCount|r v" .. RDC.GetVersion() .. " commands:")
         print("  /rdc                toggle the HUD")
         print("  /rdc report [player|top3|top5|all]   report to party/raid")
         print("  /rdc lock           lock/unlock HUD move + resize")
+        print("  /rdc minimap        show/hide the minimap button")
+        print("  /rdc demo           toggle sample data for a UI preview")
+        print("  /rdc version        print the addon version")
         print("  /rdc reset          clear this raid's counts")
     end
 end
