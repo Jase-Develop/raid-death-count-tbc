@@ -9,12 +9,15 @@ local COMM_PREFIX   = "RDC1"               -- addon-message prefix (format versi
 local POLL_INTERVAL = 0.5                  -- seconds between death sweeps
 local SYNC_THROTTLE = 5                    -- min seconds between our resync replies
 local MSG_MAX       = 230                  -- soft cap on an addon-message body before we flush a chunk
+local DEMOTE_GRACE  = 5                    -- seconds a lock:->map: (same instance) must persist before we
+                                           -- treat it as a genuinely new/unsaved lockout, not a blank read
 
 -- ── State ─────────────────────────────────────────────────────────────────────
 local DB                      -- = RaidDeathCountDB (set at ADDON_LOADED)
 local prevDead   = {}         -- fullName -> last-seen dead state (nil = no baseline yet)
 local watched    = {}         -- array of unit tokens to sweep for deaths
 local lastSyncReply = 0       -- time() of our last full-state reply (throttle)
+local mapDemoteSince          -- GetTime() when lock:->map: demotion pressure began (nil = none)
 
 -- ── Small helpers ─────────────────────────────────────────────────────────────
 
@@ -305,19 +308,24 @@ end
 
 local function UpdateRaidID()
     local rid, iname, mapID = ResolveRaidID()
-    if not rid then return end                       -- not in a raid: keep current (sticky)
+    if not rid then mapDemoteSince = nil; return end -- not in a raid: keep current (sticky)
 
     if rid ~= DB.currentRaidID then
         local oldID = DB.currentRaidID
         local oldS = oldID and DB.sessions[oldID]
 
-        -- Do NOT demote a positively resolved lock: back to a map: fallback for the SAME instance. A
-        -- map: result while standing in the instance we already track means the saved-instance cache was
-        -- momentarily empty this tick (it lags after some events), not that we changed raids. Switching
-        -- would land on a fresh zero session and look like a reset, so keep the lock: id.
+        -- lock: -> map: for the SAME instance. Two things look identical here: (a) a transient blank
+        -- saved-instance read (the cache lags after some events) while we're still saved to oldID, and
+        -- (b) standing in a genuinely new, not-yet-saved lockout of the same place (weekly/manual reset).
+        -- (a) is a one-tick blip; (b) persists. So refuse the demotion until it has held for DEMOTE_GRACE
+        -- seconds, then let it fall through to a fresh zero session (the automatic per-lockout reset).
         if rid:match("^map:") and oldID and oldID:match("^lock:") and SameInstance(oldS, iname, mapID) then
-            return
+            local now = GetTime()
+            mapDemoteSince = mapDemoteSince or now
+            if (now - mapDemoteSince) < DEMOTE_GRACE then return end
+            -- grace elapsed: this is a new lockout, fall through and switch to the fresh map: session
         end
+        mapDemoteSince = nil
 
         DB.currentRaidID = rid
         local newS = EnsureSession(rid, iname, mapID)
@@ -336,6 +344,7 @@ local function UpdateRaidID()
         RequestResync()
         RefreshHUD()
     elseif iname then
+        mapDemoteSince = nil                          -- clean read of the active id: no demotion pressure
         local s = ActiveSession()
         if s then
             if not s.instance or s.instance == "" then s.instance = iname end
@@ -445,7 +454,11 @@ frame:SetScript("OnUpdate", function(_, elapsed)
     acc = acc + elapsed
     if acc < POLL_INTERVAL then return end
     acc = 0
-    if DB and DB.currentRaidID then Sweep() end
+    if DB and DB.currentRaidID then
+        UpdateRaidID()   -- re-resolve on a steady cadence so the demotion grace window elapses even when
+                         -- GROUP_ROSTER_UPDATE is quiet (e.g. single-client testing); cheap on no change
+        Sweep()
+    end
 end)
 
 -- ── Debug ─────────────────────────────────────────────────────────────────────
