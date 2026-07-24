@@ -24,6 +24,7 @@ local peers      = {}         -- sender -> { t = time() last heard, ver = their 
 local playerName              -- our own full name, to exclude ourselves from the peer count
 local lastHeartbeat = 0       -- time() of our last presence ping (op H)
 local lastSyncCount = 0       -- last live peer count we painted (repaint only when it changes)
+local wasInRaid  = false      -- were we inside the raid instance last sweep (re-baseline on re-entry)
 
 -- ── Small helpers ─────────────────────────────────────────────────────────────
 
@@ -85,6 +86,14 @@ local function ResolveRaidID()
     -- than minting a bogus "map:nil" session that both looks like a reset and breaks the map->lock merge.
     if not mapID or mapID == 0 then return nil end
     return "map:" .. tostring(mapID), iname, mapID   -- fresh raid, not yet saved
+end
+
+-- Are we physically standing in a raid instance right now? Death counting is gated on this so the STICKY
+-- currentRaidID (kept for display/sync after we leave, e.g. corpse-running or in town) does not keep
+-- counting deaths out in the open world or in a dungeon.
+local function InRaidInstance()
+    local _, itype = IsInInstance()
+    return itype == "raid"
 end
 
 -- ── Sessions / data ───────────────────────────────────────────────────────────
@@ -327,6 +336,12 @@ end
 
 local function Sweep()
     if not DB.currentRaidID then return end
+    if not InRaidInstance() then wasInRaid = false; return end   -- only count while inside the raid instance
+    if not wasInRaid then
+        wasInRaid = true
+        wipe(prevDead)   -- just entered: re-baseline so any already-dead state (incl. a world death we
+                         -- corpse-walked in with) is recorded, not counted as a fresh death this tick
+    end
     for _, unit in ipairs(watched) do
         local name = FullName(unit)
         if name then
