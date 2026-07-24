@@ -10,11 +10,21 @@ movable, resizable Details-style HUD (class icon, name, count), sorted by deaths
 
 - **Death detection** polls `UnitIsDeadOrGhost` for each group member, so it catches far-away
   deaths a combat-log-only approach would miss. Feign Death is ignored, and a first-sight baseline
-  means players already dead when you join are not miscounted.
+  means players already dead when you join are not miscounted. Deaths are only counted while you are
+  physically inside the raid instance (not out in the world or a dungeon).
 - **Sync** shares counts over addon comms (RAID/PARTY). Counts are monotonic within a raid and
   merged by MAX, so late joins, disconnects, and duplicate messages all self-heal.
 - **Raid scoping** keeps each raid's counts separate (by lockout / instance), so an old raid's
-  totals never bleed into a new one.
+  totals never bleed into a new one, and a fresh lockout of the same instance auto-resets to zero.
+
+## The HUD
+
+- Details-style rows (rank, class icon, name, count) with a class-coloured bar, sorted by deaths.
+- Header controls (right to left): close, a pin/lock toggle for move + resize, report buttons
+  **A** / **3** / **5** (report all / top 3 / top 5 to chat), and a sync indicator showing how many
+  addons are in sync (hover it to see who).
+- Movable and resizable (drag the frame, or the bottom-right grip) when unlocked.
+- A minimap button (skull) toggles the HUD; drag it around the ring to reposition.
 
 ## Installation
 
@@ -28,10 +38,17 @@ movable, resizable Details-style HUD (class icon, name, count), sorted by deaths
 - `/rdc` (or `/rdc toggle`) - toggle the HUD.
 - `/rdc report [player <name> | top3 | top5 | all]` - report counts to raid/party (default: all).
 - `/rdc lock` - toggle the HUD move + resize lock.
-- `/rdc reset` - clear the current raid's counts.
+- `/rdc minimap` - show/hide the minimap button.
+- `/rdc demo` - toggle sample data for a UI preview (local only, never touches real counts).
+- `/rdc version` - print the addon version.
+- `/rdc reset` - clear the current raid's counts (local testing convenience; see below).
 - `/rdc <anything else>` - print the command help.
+
+Note: `/rdc reset` is local only. In a group it does not durably stick, since a peer's next sync
+heals the counts back by MAX. The per-raid reset that matters is automatic (a new lockout / different
+raid starts every client at zero).
 
 ## Status
 
-Early build. The core, sync, and HUD are in place; in-game testing across multiple clients is
-ongoing.
+Working build (v0.2), tested in a live raid on a single client. The core, sync, and HUD are in place;
+cross-client sync verification is ongoing.
