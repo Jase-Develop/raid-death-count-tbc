@@ -109,26 +109,64 @@ closeBtn:SetScript("OnEnter", function() cx:SetTextColor(1, 0.3, 0.3) end)
 closeBtn:SetScript("OnLeave", function() cx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3]) end)
 closeBtn:SetScript("OnClick", function() RDC.SetHUDShown(false) end)
 
--- Lock button: toggles move/resize; tinted accent when locked.
+-- Lock (pin) button: toggles move/resize. Padlock icon, closed + accent when locked, open + dim when not.
 local lockBtn = CreateFrame("Button", nil, header, "BackdropTemplate")
 lockBtn:SetSize(HEADER_H - 4, HEADER_H - 4)
 lockBtn:SetPoint("RIGHT", closeBtn, "LEFT", -2, 0)
 ApplyFlat(lockBtn, THEME.bg, true)
-local lockTx = lockBtn:CreateFontString(nil, "OVERLAY")
-ApplyFont(lockTx, 11)
-lockTx:SetPoint("CENTER")
-lockTx:SetText("L")
+local lockIcon = lockBtn:CreateTexture(nil, "OVERLAY")
+lockIcon:SetSize(HEADER_H - 8, HEADER_H - 8)
+lockIcon:SetPoint("CENTER")
 
 local function RefreshLock()
     local db = DB()
     local locked = db and db.locked
+    lockIcon:SetTexture(locked and "Interface\\Buttons\\LockButton-Locked-Up"
+                                or  "Interface\\Buttons\\LockButton-Unlocked-Up")
     if locked then
-        lockTx:SetTextColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
+        lockIcon:SetVertexColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
     else
-        lockTx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+        lockIcon:SetVertexColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
     end
 end
 lockBtn:SetScript("OnClick", function() RDC.ToggleLock() end)
+lockBtn:SetScript("OnEnter", function(self)
+    local db = DB()
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText((db and db.locked) and "Unlock HUD" or "Lock HUD")
+    GameTooltip:Show()
+end)
+lockBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+-- Report buttons (left of the lock button): one-glyph flat squares that post counts to raid/party.
+-- Left to right: 5 (top 5), 3 (top 3), A (all).
+local function MakeReportButton(label, anchorTo, tooltip, mode)
+    local b = CreateFrame("Button", nil, header, "BackdropTemplate")
+    b:SetSize(HEADER_H - 4, HEADER_H - 4)
+    b:SetPoint("RIGHT", anchorTo, "LEFT", -2, 0)
+    ApplyFlat(b, THEME.bg, true)
+    local tx = b:CreateFontString(nil, "OVERLAY")
+    ApplyFont(tx, 10)
+    tx:SetPoint("CENTER")
+    tx:SetText(label)
+    tx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+    b:SetScript("OnEnter", function(self)
+        tx:SetTextColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:SetText(tooltip)
+        GameTooltip:Show()
+    end)
+    b:SetScript("OnLeave", function()
+        tx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+        GameTooltip:Hide()
+    end)
+    b:SetScript("OnClick", function() RDC.Report(mode) end)
+    return b
+end
+
+local report5Btn   = MakeReportButton("5", lockBtn,    "Report top 5",      "top5")
+local report3Btn   = MakeReportButton("3", report5Btn,  "Report top 3",      "top3")
+local reportAllBtn = MakeReportButton("A", report3Btn,  "Report all deaths", "all")
 
 -- ── Resize grip (bottom-right) ────────────────────────────────────────────────
 local grip = CreateFrame("Button", nil, hud)
