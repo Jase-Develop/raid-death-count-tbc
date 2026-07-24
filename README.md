@@ -41,12 +41,10 @@ movable, resizable Details-style HUD (class icon, name, count), sorted by deaths
 - `/rdc minimap` - show/hide the minimap button.
 - `/rdc demo` - toggle sample data for a UI preview (local only, never touches real counts).
 - `/rdc version` - print the addon version.
-- `/rdc reset` - clear the current raid's counts (local testing convenience; see below).
 - `/rdc <anything else>` - print the command help.
 
-Note: `/rdc reset` is local only. In a group it does not durably stick, since a peer's next sync
-heals the counts back by MAX. The per-raid reset that matters is automatic (a new lockout / different
-raid starts every client at zero).
+Counts reset automatically per raid: a new lockout or a different raid starts every client at zero,
+so there is no manual reset to run.
 
 ## Status
 
