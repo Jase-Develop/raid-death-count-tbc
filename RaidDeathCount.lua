@@ -11,6 +11,8 @@ local SYNC_THROTTLE = 5                    -- min seconds between our resync rep
 local MSG_MAX       = 230                  -- soft cap on an addon-message body before we flush a chunk
 local DEMOTE_GRACE  = 5                    -- seconds a lock:->map: (same instance) must persist before we
                                            -- treat it as a genuinely new/unsaved lockout, not a blank read
+local PEER_STALE    = 90                   -- seconds before a silent peer drops out of the sync count
+local HEARTBEAT     = 30                   -- seconds between our presence pings (op H)
 
 -- ── State ─────────────────────────────────────────────────────────────────────
 local DB                      -- = RaidDeathCountDB (set at ADDON_LOADED)
@@ -18,6 +20,10 @@ local prevDead   = {}         -- fullName -> last-seen dead state (nil = no base
 local watched    = {}         -- array of unit tokens to sweep for deaths
 local lastSyncReply = 0       -- time() of our last full-state reply (throttle)
 local mapDemoteSince          -- GetTime() when lock:->map: demotion pressure began (nil = none)
+local peers      = {}         -- sender -> { t = time() last heard, ver = their addon version }
+local playerName              -- our own full name, to exclude ourselves from the peer count
+local lastHeartbeat = 0       -- time() of our last presence ping (op H)
+local lastSyncCount = 0       -- last live peer count we painted (repaint only when it changes)
 
 -- ── Small helpers ─────────────────────────────────────────────────────────────
 
@@ -195,8 +201,9 @@ end
 
 -- ── Comms ─────────────────────────────────────────────────────────────────────
 -- Wire format: "<raidID>|<op>|<payload>". Ops: D = one death (name,class,deaths); ? = resync request;
--- S = full-state chunk (name,class,deaths;...). Messages for a different RaidID are ignored. Merge is
--- by max per player, so duplicate/out-of-order/chunked S messages all converge safely.
+-- S = full-state chunk (name,class,deaths;...); H = presence ping (payload = sender version), used to
+-- count how many addons are in sync. Messages for a different RaidID are ignored. Merge is by max per
+-- player, so duplicate/out-of-order/chunked S messages all converge safely.
 
 local function SendComm(msg)
     local ch = GroupChannel()
@@ -217,6 +224,56 @@ end
 local function RequestResync()
     if not DB.currentRaidID then return end
     SendComm(DB.currentRaidID .. "|?|")
+end
+
+-- ── Peer presence (the "in sync" count) ───────────────────────────────────────
+-- Every client running RDC announces itself (op H, payload = version). We keep a table of the senders
+-- we have recently heard from and count them (+ ourselves) to show how many addons are in sync. Scoped
+-- to our RaidID like everything else, so it counts only peers syncing the SAME raid.
+
+-- Announce our presence + version. Same triggers as RequestResync, plus a periodic heartbeat, so late
+-- joiners / reloads are discovered and peers who leave or disconnect age out of the count.
+local function AnnouncePresence()
+    if not DB.currentRaidID then return end
+    SendComm(DB.currentRaidID .. "|H|" .. RDC.GetVersion())
+end
+
+local function IsSelf(sender)
+    if not sender or sender == "" then return true end
+    if playerName and sender == playerName then return true end
+    local short = sender:match("^[^-]+")                 -- our own broadcasts loop back to us; drop them
+    return short ~= nil and short == UnitName("player")
+end
+
+-- Note that we just heard from a peer (any op keeps them alive; H also carries their version).
+local function TouchPeer(sender, op, payload)
+    if IsSelf(sender) then return end
+    local ver = (op == "H" and payload and payload ~= "" and payload) or (peers[sender] and peers[sender].ver)
+    peers[sender] = { t = time(), ver = ver }
+end
+
+-- Count OTHER live peers, pruning any that have gone silent past PEER_STALE.
+local function LivePeerCount()
+    local now, n = time(), 0
+    for name, p in pairs(peers) do
+        if now - (p.t or 0) > PEER_STALE then peers[name] = nil else n = n + 1 end
+    end
+    return n
+end
+
+-- How many addons are in sync right now (us + live peers). Always at least 1 (ourselves).
+function RDC.GetSyncCount()
+    return 1 + LivePeerCount()
+end
+
+-- Live peers as a sorted list of { name, ver } for the HUD tooltip (excludes ourselves).
+function RDC.GetSyncPeers()
+    local now, out = time(), {}
+    for name, p in pairs(peers) do
+        if now - (p.t or 0) <= PEER_STALE then out[#out + 1] = { name = name, ver = p.ver } end
+    end
+    table.sort(out, function(a, b) return a.name < b.name end)
+    return out
 end
 
 -- Reply to a resync request with our full state, packed into <=MSG_MAX chunks (throttled).
@@ -246,6 +303,7 @@ end
 local function OnComm(msg, sender)
     local rid, op, payload = msg:match("^(.-)|(.-)|(.*)$")
     if not rid or rid ~= DB.currentRaidID then return end
+    TouchPeer(sender, op, payload)                       -- any op from a peer keeps them in the sync count
     if op == "D" then
         local name, class, deaths = payload:match("^(.-),(.-),(%d+)$")
         if name and ApplyRemote(name, class, tonumber(deaths)) then RefreshHUD() end
@@ -257,6 +315,8 @@ local function OnComm(msg, sender)
         if changed then RefreshHUD() end
     elseif op == "?" then
         SendFullState()
+    elseif op == "H" then
+        RefreshHUD()                                     -- a new/refreshed peer may change the sync count
     end
 end
 
@@ -427,21 +487,25 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         end
 
     elseif event == "PLAYER_LOGIN" then
+        playerName = FullName("player")
         RebuildWatched()
         UpdateRaidID()
         if RDC.InitHUD then RDC.InitHUD() end
         if RDC.InitMinimap then RDC.InitMinimap() end
         RequestResync()
+        AnnouncePresence()
         print(("|cff88bbffRaid Death Count|r v%s loaded. Enjoy!"):format(RDC.GetVersion()))
 
     elseif event == "PLAYER_ENTERING_WORLD" then
         RebuildWatched()
         UpdateRaidID()
         RequestResync()
+        AnnouncePresence()
 
     elseif event == "GROUP_ROSTER_UPDATE" then
         RebuildWatched()
         UpdateRaidID()
+        AnnouncePresence()
 
     elseif event == "CHAT_MSG_ADDON" then
         if arg1 == COMM_PREFIX and DB then OnComm(arg2, arg4) end
@@ -458,6 +522,12 @@ frame:SetScript("OnUpdate", function(_, elapsed)
         UpdateRaidID()   -- re-resolve on a steady cadence so the demotion grace window elapses even when
                          -- GROUP_ROSTER_UPDATE is quiet (e.g. single-client testing); cheap on no change
         Sweep()
+        -- Presence heartbeat + age-out: ping every HEARTBEAT secs, and if the live peer count changed
+        -- (someone joined, reloaded, or went silent) repaint so the HUD's sync number stays current.
+        local now = time()
+        if now - lastHeartbeat >= HEARTBEAT then lastHeartbeat = now; AnnouncePresence() end
+        local c = LivePeerCount()
+        if c ~= lastSyncCount then lastSyncCount = c; RefreshHUD() end
     end
 end)
 

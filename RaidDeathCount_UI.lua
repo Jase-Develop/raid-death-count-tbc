@@ -168,6 +168,51 @@ local report5Btn   = MakeReportButton("5", lockBtn,    "Report top 5",      "top
 local report3Btn   = MakeReportButton("3", report5Btn,  "Report top 3",      "top3")
 local reportAllBtn = MakeReportButton("A", report3Btn,  "Report all deaths", "all")
 
+-- Sync indicator (left of the report buttons): a small dot + number = how many addons are in sync
+-- (us + live peers). Green when others are syncing, grey when we are the only one. Shown only in a group.
+local syncTag = CreateFrame("Frame", nil, header)
+syncTag:SetSize(26, HEADER_H - 4)
+syncTag:SetPoint("RIGHT", reportAllBtn, "LEFT", -5, 0)
+syncTag:EnableMouse(true)
+local syncDot = syncTag:CreateTexture(nil, "OVERLAY")
+syncDot:SetSize(9, 9)
+syncDot:SetPoint("LEFT", syncTag, "LEFT", 0, 0)
+local syncTx = syncTag:CreateFontString(nil, "OVERLAY")
+ApplyFont(syncTx, 10)
+syncTx:SetPoint("LEFT", syncDot, "RIGHT", 2, 0)
+
+local function UpdateSyncTag()
+    if not (RDC.GetSyncCount and IsInGroup()) then syncTag:Hide(); return end
+    local n = RDC.GetSyncCount()
+    syncTag:Show()
+    syncDot:SetTexture(n > 1 and "Interface\\COMMON\\Indicator-Green" or "Interface\\COMMON\\Indicator-Gray")
+    syncTx:SetText(n)
+    if n > 1 then
+        syncTx:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+    else
+        syncTx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+    end
+end
+
+syncTag:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    local ver = RDC.GetVersion and RDC.GetVersion() or "?"
+    local peers = RDC.GetSyncPeers and RDC.GetSyncPeers() or {}
+    GameTooltip:SetText("Addons in sync: " .. (RDC.GetSyncCount and RDC.GetSyncCount() or 1))
+    GameTooltip:AddLine("You  |cff888888v" .. ver .. "|r", 0.5, 0.9, 0.5)
+    for _, p in ipairs(peers) do
+        local short = p.name:match("^[^-]+") or p.name
+        if p.ver and p.ver ~= ver then
+            GameTooltip:AddLine(short .. "  |cffd9a066v" .. p.ver .. "|r", 0.8, 0.8, 0.8)   -- version mismatch
+        else
+            GameTooltip:AddLine(short, 0.8, 0.8, 0.8)
+        end
+    end
+    if #peers == 0 then GameTooltip:AddLine("No one else is running the addon.", 0.6, 0.6, 0.6, true) end
+    GameTooltip:Show()
+end)
+syncTag:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
 -- ── Resize grip (bottom-right) ────────────────────────────────────────────────
 local grip = CreateFrame("Button", nil, hud)
 grip:SetSize(14, 14)
@@ -288,6 +333,8 @@ function RDC.RefreshHUD()
     -- Reflect instance name in the title when we have one.
     local inst = RDC.GetInstanceName()
     title:SetText(inst and ("Deaths - " .. inst) or "Raid Death Count")
+
+    UpdateSyncTag()
 end
 
 -- ── Show / lock API ───────────────────────────────────────────────────────────
@@ -429,7 +476,6 @@ do
         local ver = RDC.GetVersion and RDC.GetVersion() or "?"
         GameTooltip:SetText("Raid Death Count  |cff888888v" .. ver .. "|r", THEME.accent[1], THEME.accent[2], THEME.accent[3])
         GameTooltip:AddLine("Click to toggle the HUD.", 0.8, 0.8, 0.8, true)
-        GameTooltip:AddLine("Drag to move around the minimap.", 0.8, 0.8, 0.8, true)
         GameTooltip:Show()
     end)
     btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
