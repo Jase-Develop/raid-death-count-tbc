@@ -15,7 +15,9 @@ local PEER_STALE    = 90                   -- seconds before a silent peer drops
 local HEARTBEAT     = 30                   -- seconds between our presence pings (op H)
 
 -- ── State ─────────────────────────────────────────────────────────────────────
-local DB                      -- = RaidDeathCountDB (set at ADDON_LOADED)
+local DB                      -- = RaidDeathCountCharDB, PER CHARACTER (set at ADDON_LOADED): sessions +
+                              -- currentRaidID. UI prefs (hud, minimap) stay account-wide in
+                              -- RaidDeathCountDB, which the UI file reads directly.
 local prevDead   = {}         -- fullName -> last-seen dead state (nil = no baseline yet)
 local watched    = {}         -- array of unit tokens to sweep for deaths
 local lastSyncReply = 0       -- time() of our last full-state reply (throttle)
@@ -492,11 +494,21 @@ frame:RegisterEvent("CHAT_MSG_ADDON")
 frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     if event == "ADDON_LOADED" then
         if arg1 ~= ADDON_NAME then return end
+        -- Account-wide: UI preferences only, so the HUD keeps its size/place on every character.
         RaidDeathCountDB = RaidDeathCountDB or {}
-        DB = RaidDeathCountDB
+        RaidDeathCountDB.hud = RaidDeathCountDB.hud or {}
+        RaidDeathCountDB.minimap = RaidDeathCountDB.minimap or {}
+        -- Death data is PER CHARACTER: an alt that never set foot in the raid must not inherit the
+        -- main's counts or its sticky currentRaidID. Walking that alt into the same raid still fills
+        -- the counts back in from peers (comms are scoped by RaidID, merged by MAX), which is correct:
+        -- the counts belong to the raid, the storage belongs to the character.
+        RaidDeathCountCharDB = RaidDeathCountCharDB or {}
+        DB = RaidDeathCountCharDB
         DB.sessions = DB.sessions or {}
-        DB.hud = DB.hud or {}
-        DB.minimap = DB.minimap or {}
+        -- Pre-0.3 sessions were account-wide. They cannot be attributed to a character now, so rather
+        -- than handing every alt the main's history we drop them; the active run re-syncs from peers.
+        RaidDeathCountDB.sessions = nil
+        RaidDeathCountDB.currentRaidID = nil
         if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
             C_ChatInfo.RegisterAddonMessagePrefix(COMM_PREFIX)
         end

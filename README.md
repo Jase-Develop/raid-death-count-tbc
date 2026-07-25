@@ -16,6 +16,9 @@ movable, resizable Details-style HUD (class icon, name, count), sorted by deaths
   merged by MAX, so late joins, disconnects, and duplicate messages all self-heal.
 - **Raid scoping** keeps each raid's counts separate (by lockout / instance), so an old raid's
   totals never bleed into a new one, and a fresh lockout of the same instance auto-resets to zero.
+- **Counts are saved per character**, so an alt does not inherit a raid it was never in. HUD position
+  and size are shared account-wide. If that alt does walk into the raid with other addon users, sync
+  fills its counts back in: the counts belong to the raid, the storage belongs to the character.
 
 ## The HUD
 

@@ -3,6 +3,7 @@
 ## Notes: A lean HUD that tracks and syncs per-player death counts in a raid (TBC 2.5.6)
 ## Version: 0.2
 ## SavedVariables: RaidDeathCountDB
+## SavedVariablesPerCharacter: RaidDeathCountCharDB
 
 RaidDeathCount.lua
 RaidDeathCount_UI.lua
