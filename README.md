@@ -51,5 +51,5 @@ so there is no manual reset to run.
 
 ## Status
 
-Working build (v0.2), tested in a live raid on a single client. The core, sync, and HUD are in place;
+Working build (v0.3), tested in a live raid on a single client. The core, sync, and HUD are in place;
 cross-client sync verification is ongoing.
