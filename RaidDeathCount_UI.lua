@@ -283,6 +283,14 @@ local function MakeRow(i)
     return row
 end
 
+-- Trims the zone prefix off an instance name so the title stays short:
+-- "Coilfang: Serpentshrine Cavern" becomes "Serpentshrine Cavern". Names with no prefix are unchanged.
+local function ShortInstance(name)
+    if not name then return nil end
+    local tail = name:match("^.-:%s*(.+)$")
+    return tail or name
+end
+
 -- ── Refresh ───────────────────────────────────────────────────────────────────
 function RDC.RefreshHUD()
     if not hud:IsShown() then return end
@@ -331,8 +339,8 @@ function RDC.RefreshHUD()
     end
 
     -- Reflect instance name in the title when we have one.
-    local inst = RDC.GetInstanceName()
-    title:SetText(inst and ("Deaths - " .. inst) or "Raid Death Count")
+    local inst = ShortInstance(RDC.GetInstanceName())
+    title:SetText(inst and ("RDC: " .. inst) or "Raid Death Count")
 
     UpdateSyncTag()
 end
