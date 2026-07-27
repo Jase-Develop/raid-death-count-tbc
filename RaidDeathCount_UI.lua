@@ -15,7 +15,6 @@ local THEME = {
 local FONT = "Fonts\\ARIALN.TTF"
 local FONT_FB = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
 
--- Layout constants.
 local HEADER_H = 18
 local ROW_H    = 18
 local PAD      = 4
@@ -30,7 +29,7 @@ local function ApplyFont(fs, size, flags)
     return fs
 end
 
--- Flat fill + optional 1px border (requires the BackdropTemplate mixin).
+-- Requires the frame to carry the BackdropTemplate mixin, which this client needs for SetBackdrop.
 local function ApplyFlat(frame, color, border)
     if not frame.SetBackdrop then return end
     frame:SetBackdrop({
@@ -71,7 +70,6 @@ local function SavePlacement()
     db.point, db.relPoint, db.x, db.y = point, relPoint, x, y
 end
 
--- Whole-frame drag (guarded by the lock).
 hud:SetMovable(true)
 hud:EnableMouse(true)
 hud:RegisterForDrag("LeftButton")
@@ -95,7 +93,6 @@ title:SetPoint("LEFT", header, "LEFT", 5, 0)
 title:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
 title:SetText("Raid Death Count")
 
--- Close button: hides the HUD (same as /rdc).
 local closeBtn = CreateFrame("Button", nil, header, "BackdropTemplate")
 closeBtn:SetSize(HEADER_H - 4, HEADER_H - 4)
 closeBtn:SetPoint("RIGHT", header, "RIGHT", -3, 0)
@@ -109,7 +106,6 @@ closeBtn:SetScript("OnEnter", function() cx:SetTextColor(1, 0.3, 0.3) end)
 closeBtn:SetScript("OnLeave", function() cx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3]) end)
 closeBtn:SetScript("OnClick", function() RDC.SetHUDShown(false) end)
 
--- Lock (pin) button: toggles move/resize. Padlock icon, closed + accent when locked, open + dim when not.
 local lockBtn = CreateFrame("Button", nil, header, "BackdropTemplate")
 lockBtn:SetSize(HEADER_H - 4, HEADER_H - 4)
 lockBtn:SetPoint("RIGHT", closeBtn, "LEFT", -2, 0)
@@ -138,8 +134,8 @@ lockBtn:SetScript("OnEnter", function(self)
 end)
 lockBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
--- Report buttons (left of the lock button): one-glyph flat squares that post counts to raid/party.
--- Left to right: 5 (top 5), 3 (top 3), A (all).
+-- Each button anchors to the LEFT of the previous one, so they are created right to left and read
+-- A, 3, 5 on screen.
 local function MakeReportButton(label, anchorTo, tooltip, mode)
     local b = CreateFrame("Button", nil, header, "BackdropTemplate")
     b:SetSize(HEADER_H - 4, HEADER_H - 4)
@@ -168,8 +164,7 @@ local report5Btn   = MakeReportButton("5", lockBtn,    "Report top 5",      "top
 local report3Btn   = MakeReportButton("3", report5Btn,  "Report top 3",      "top3")
 local reportAllBtn = MakeReportButton("A", report3Btn,  "Report all deaths", "all")
 
--- Sync indicator (left of the report buttons): a small dot + number = how many addons are in sync
--- (us + live peers). Green when others are syncing, grey when we are the only one. Shown only in a group.
+-- Dot + count of addons in sync (us + live peers). Hidden when ungrouped, where the number is always 1.
 local syncTag = CreateFrame("Frame", nil, header)
 syncTag:SetSize(26, HEADER_H - 4)
 syncTag:SetPoint("RIGHT", reportAllBtn, "LEFT", -5, 0)
@@ -227,8 +222,8 @@ grip:SetScript("OnMouseDown", function()
 end)
 grip:SetScript("OnMouseUp", function() hud:StopMovingOrSizing(); SavePlacement(); RDC.RefreshHUD() end)
 
--- Reflow live while sizing (bar widths + visible row count both derive from the body size), so the
--- rows track the drag instead of snapping into place only when the grip is released.
+-- Bar widths and the visible row count both derive from the body size, so reflow live during the drag
+-- rather than letting the rows snap into place only on release.
 hud:SetScript("OnSizeChanged", function() if RDC.RefreshHUD then RDC.RefreshHUD() end end)
 
 -- ── Body / rows ───────────────────────────────────────────────────────────────
@@ -245,7 +240,6 @@ emptyText:SetText("No deaths recorded")
 local ROW_POOL = 40
 local rows = {}
 
--- Build one bar row (class-colour bar sized to the leader, rank + icon + name + count).
 local function MakeRow(i)
     local row = CreateFrame("Frame", nil, body)
     row:SetHeight(ROW_H - 1)
@@ -278,13 +272,13 @@ local function MakeRow(i)
     row.count:SetJustifyH("RIGHT")
     row.count:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
 
-    -- Count occupies the right end; name fills the gap between the icon and the count.
+    -- Second anchor on name, set after count exists, so it stretches to fill the gap and truncates
+    -- instead of overrunning the count.
     row.name:SetPoint("RIGHT", row.count, "LEFT", -4, 0)
     return row
 end
 
--- Trims the zone prefix off an instance name so the title stays short:
--- "Coilfang: Serpentshrine Cavern" becomes "Serpentshrine Cavern". Names with no prefix are unchanged.
+-- "Coilfang: Serpentshrine Cavern" becomes "Serpentshrine Cavern"; unprefixed names pass through.
 local function ShortInstance(name)
     if not name then return nil end
     local tail = name:match("^.-:%s*(.+)$")
@@ -314,7 +308,7 @@ function RDC.RefreshHUD()
             local r, g, b = 0.4, 0.4, 0.4
             if c then r, g, b = c.r, c.g, c.b end
 
-            -- Bar width proportional to the leader's count (min sliver so a 1-death bar reads).
+            -- Proportional to the leader's count, floored at a sliver so a 1-death bar is still visible.
             local frac = math.max(0.12, e.deaths / top)
             row.bar:SetWidth(bodyW * frac)
             row.bar:SetVertexColor(r, g, b, 0.55)
@@ -338,7 +332,6 @@ function RDC.RefreshHUD()
         end
     end
 
-    -- Reflect instance name in the title when we have one.
     local inst = ShortInstance(RDC.GetInstanceName())
     title:SetText(inst and ("RDC: " .. inst) or "Raid Death Count")
 
@@ -371,21 +364,19 @@ function RDC.InitHUD()
         hud:SetPoint(db.point, UIParent, db.relPoint, db.x or 0, db.y or 0)
     end
     RefreshLock()
-    if db.shown == nil then db.shown = true end   -- visible by default (Details-style)
+    if db.shown == nil then db.shown = true end   -- visible by default, Details-style
     if db.shown then hud:Show() else hud:Hide() end
     RDC.RefreshHUD()
 end
 
 -- ── Minimap button ──────────────────────────────────────────────────────────────
--- Hand-rolled draggable minimap button (no LibDBIcon/LibStub), borrowed from WarlockQol. Left-click
--- toggles the HUD; drag slides it around the ring. Angle + hidden state persist in RaidDeathCountDB.minimap.
--- Created here but positioned/shown on PLAYER_LOGIN via RDC.InitMinimap (DB is ready by then).
+-- Hand-rolled rather than LibDBIcon, since the addon carries no libraries. Created at load but positioned
+-- and shown from RDC.InitMinimap on PLAYER_LOGIN, once the saved variables exist.
 do
     local DEFAULT_ANGLE = 200   -- degrees; lower-left, clear of the zoom +/- buttons
 
-    -- Minimap SHAPE support so the button sits right on square minimaps (ElvUI) too, without LibDBIcon.
-    -- Skinning addons expose GetMinimapShape(); each entry flags whether each QUADRANT is rounded (true)
-    -- or squared (false), ordered {BR, BL, TR, TL}. Absent -> ROUND. Same public table LibDBIcon uses.
+    -- Skinning addons expose GetMinimapShape(). Each entry flags whether that QUADRANT is rounded (true)
+    -- or squared (false), ordered {BR, BL, TR, TL}. Absent means ROUND. Same public contract LibDBIcon uses.
     local MINIMAP_SHAPES = {
         ["ROUND"]                 = { true,  true,  true,  true  },
         ["SQUARE"]                = { false, false, false, false },
@@ -412,21 +403,20 @@ do
     btn:RegisterForClicks("LeftButtonUp")
     btn:RegisterForDrag("LeftButton")
 
-    -- Skull icon, trimmed of its default border.
+    -- TexCoord inset crops the icon's baked-in border.
     local icon = btn:CreateTexture(nil, "ARTWORK")
     icon:SetSize(19, 19)
     icon:SetPoint("TOPLEFT", 7, -6)
     icon:SetTexture("Interface\\Icons\\INV_Misc_Bone_HumanSkull_01")
     icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
-    -- Classic round bezel so it matches every other minimap button.
     local border = btn:CreateTexture(nil, "OVERLAY")
     border:SetSize(53, 53)
     border:SetPoint("TOPLEFT")
     border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
 
-    -- Place the button from the current angle, hugging the minimap edge (on the circle for a rounded
-    -- quadrant, clamped to the square edge otherwise). w/h from the live minimap size (+5px) so it tracks resizes.
+    -- Half-extents come from the live minimap size rather than a constant, so the button tracks a skin
+    -- that resizes the minimap after login.
     local angle = DEFAULT_ANGLE
     local function UpdatePosition()
         local a = math.rad(angle)
@@ -450,10 +440,9 @@ do
         btn:SetPoint("CENTER", Minimap, "CENTER", x, y)
     end
 
-    -- Reposition if the minimap is resized (ElvUI etc. can change its size after login).
     Minimap:HookScript("OnSizeChanged", function() UpdatePosition() end)
 
-    -- Drag: turn the cursor's position (relative to the minimap centre) back into an angle.
+    -- Converts the cursor's offset from the minimap centre back into the stored angle.
     local dragging = false
     local function OnDragUpdate()
         local mx, my = Minimap:GetCenter()
@@ -472,10 +461,9 @@ do
         dragging = false
         self:SetScript("OnUpdate", nil)
         local db = MMDB()
-        if db then db.angle = angle end   -- persist the new position
+        if db then db.angle = angle end
     end)
 
-    -- Left-click toggles the HUD (open if closed, close if open), same as /rdc.
     btn:SetScript("OnClick", function() RDC.ToggleHUD() end)
 
     btn:SetScript("OnEnter", function(self)
@@ -488,10 +476,8 @@ do
     end)
     btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-    btn:Hide()   -- shown by InitMinimap once the saved hidden flag is known
+    btn:Hide()   -- InitMinimap shows it once the saved hidden flag is readable
 
-    -- Public API + login init. Angle + hidden state live in RaidDeathCountDB.minimap; nil = shown, nil
-    -- angle = DEFAULT_ANGLE.
     function RDC.IsMinimapHidden()
         local db = MMDB()
         return (db and db.hidden) and true or false
@@ -506,7 +492,7 @@ do
         RDC.SetMinimapHidden(not RDC.IsMinimapHidden())
         print("|cff88bbffRaidDeathCount|r minimap button " .. (RDC.IsMinimapHidden() and "hidden." or "shown."))
     end
-    -- Called from the core's PLAYER_LOGIN once the DB is resolved.
+    -- Called from the core's PLAYER_LOGIN, once RaidDeathCountDB is resolved.
     function RDC.InitMinimap()
         local db = MMDB()
         if db and db.angle then angle = db.angle end

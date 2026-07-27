@@ -37,20 +37,19 @@ function RDC.GetVersion()
     return (getMeta and getMeta(ADDON_NAME, "Version")) or "?"
 end
 
--- "Name-Realm" (or plain "Name" same-realm) for a unit; the shared key every observer agrees on.
+-- The player key every observer computes identically, which is what lets counts merge across clients.
 local function FullName(unit)
     if not UnitExists(unit) then return nil end
     return GetUnitName(unit, true)
 end
 
--- The addon channel for the current group (nil when ungrouped, so comms simply go quiet solo).
+-- nil when ungrouped, so every comms path goes quiet solo instead of erroring.
 local function GroupChannel()
     if IsInRaid() then return "RAID" end
     if IsInGroup() then return "PARTY" end
     return nil
 end
 
--- Rebuild the list of unit tokens whose death we track (self always included so solo runs still count).
 local function RebuildWatched()
     wipe(watched)
     if IsInRaid() then
@@ -64,22 +63,14 @@ local function RebuildWatched()
 end
 
 -- ── RaidID (sync scope) ───────────────────────────────────────────────────────
--- Different RaidIDs are different raids and never merge, so the id has to be a value every client in the
--- raid computes identically. That is the instance mapID, and only the mapID: it is a client-side constant
--- (two clients agreed on map:548 for a whole SSC run, confirmed live). An earlier design preferred the
--- server lockout id and fell back to the mapID, on the assumption that the lockout id is shared between
--- everyone saved to the same reset. That assumption was never confirmed, and if it is wrong the key
--- splits the raid in two and sync stops dead, so the lockout is no longer part of the key at all. What it
--- IS still good for, purely locally, is spotting a new lockout: see CheckLockout below.
---
--- The active id is STICKY: kept while we're outside (corpse-running, town) so counts survive leaving and
--- re-entering; it only switches when we positively resolve a different raid.
+-- The id must be a value every client in the raid computes identically, or the group splits into
+-- non-syncing halves. The instance mapID is a client-side constant and satisfies that; the server lockout
+-- id was never confirmed to, so it is session metadata only (see CheckLockout). The active id is STICKY:
+-- kept while outside (corpse-running, town) so counts survive leaving and re-entering.
 
--- The server lockout we're saved to for `instanceName`, as (id, secondsUntilReset), or nil when we are
--- not saved to it. Note GetInstanceInfo returns the zone-prefixed name ("Coilfang: Serpentshrine Cavern")
--- while the saved-instance list stores the bare instance ("Serpentshrine Cavern"), so an exact compare
--- silently never matches for prefixed raids (a real bug: it made the whole lockout path dead code for
--- SSC). Match the full name or the tail after the colon.
+-- Returns (lockoutID, secondsUntilReset), or nil when we are not saved to `instanceName`. GetInstanceInfo
+-- returns the zone-prefixed name ("Coilfang: Serpentshrine Cavern") while the saved-instance list stores
+-- the bare one ("Serpentshrine Cavern"), so an exact compare silently never matches for prefixed raids.
 local function FindLockout(instanceName)
     if not instanceName or instanceName == "" then return nil end
     local tail = instanceName:match("^.-:%s*(.+)$")
@@ -92,20 +83,18 @@ local function FindLockout(instanceName)
     end
 end
 
--- Returns a RaidID string + the instance name + mapID, or nil when we're not standing in a raid instance.
 local function ResolveRaidID()
     local iname, itype, _, _, _, _, _, mapID = GetInstanceInfo()
     if itype ~= "raid" then return nil end
-    -- A nil/0 mapID is a transient read (blank instance info for a tick, seen mid-instance on phase
-    -- changes) - return nil so UpdateRaidID keeps the current id rather than minting a bogus "map:nil"
-    -- session, which both looks like a reset and strands the run's counts.
+    -- A nil/0 mapID is a transient blank read, seen for a tick mid-instance on phase changes. Returning
+    -- nil makes UpdateRaidID keep the current id rather than mint a bogus "map:nil" session, which would
+    -- both look like a reset and strand the run's counts.
     if not mapID or mapID == 0 then return nil end
     return "map:" .. tostring(mapID), iname, mapID
 end
 
--- Are we physically standing in a raid instance right now? Death counting is gated on this so the STICKY
--- currentRaidID (kept for display/sync after we leave, e.g. corpse-running or in town) does not keep
--- counting deaths out in the open world or in a dungeon.
+-- Counting gates on this rather than on currentRaidID, which is sticky and would otherwise keep counting
+-- deaths out in the open world or in a dungeon.
 local function InRaidInstance()
     local _, itype = IsInInstance()
     return itype == "raid"
@@ -118,7 +107,6 @@ local function EnsureSession(rid, iname, mapID)
     return DB.sessions[rid]
 end
 
--- The session for the active RaidID, or nil if we have no raid context yet.
 local function ActiveSession()
     if not DB or not DB.currentRaidID then return nil end
     return DB.sessions[DB.currentRaidID]
@@ -128,7 +116,6 @@ local function RefreshHUD()
     if RDC.RefreshHUD then RDC.RefreshHUD() end
 end
 
--- Keep only the N most recent sessions so the DB never grows without bound.
 local function PruneSessions(keep)
     local ids = {}
     for id in pairs(DB.sessions) do ids[#ids + 1] = id end
@@ -141,7 +128,6 @@ end
 
 -- ── Death recording + merge ───────────────────────────────────────────────────
 
--- Record a locally-witnessed death: increment, persist, broadcast, refresh. Returns the new count.
 local function RecordDeath(name, class)
     local s = ActiveSession()
     if not s then return end
@@ -154,8 +140,8 @@ local function RecordDeath(name, class)
     return p.deaths
 end
 
--- Merge a remote count by MAX (counts only rise within a raid, so max always converges). Returns true
--- if anything changed.
+-- Merge by MAX. Counts only rise within a raid, so every client converges without dedup, ordering or
+-- authority, which is what makes late-join, reconnect and duplicate messages self-heal.
 local function ApplyRemote(name, class, deaths)
     local s = ActiveSession()
     if not s or not name or not deaths then return false end
@@ -171,9 +157,7 @@ end
 
 -- ── Snapshot (for HUD + reports) ──────────────────────────────────────────────
 
--- Array of { name, class, deaths } with deaths > 0, sorted by deaths desc then name asc.
--- When demo mode is on (RDC.demoData set), the snapshot mirrors that fake data instead of the session,
--- so a UI pass can be done anywhere without a raid or real deaths.
+-- Sorted by deaths desc, then name asc. Mirrors RDC.demoData instead of the session when demo mode is on.
 function RDC.GetSnapshot()
     local out = {}
     if RDC.demoData then
@@ -204,8 +188,7 @@ function RDC.GetInstanceName()
 end
 
 -- ── Demo / UI-preview mode ─────────────────────────────────────────────────────
--- Toggles fake data (5 rows, varied classes/counts) so the HUD can be styled outside a raid. Purely
--- local: never touches the DB sessions and never broadcasts. Also force-shows the HUD so it's visible.
+-- Local only: never writes the DB sessions and never broadcasts.
 function RDC.ToggleDemo()
     if RDC.demoData then
         RDC.demoData = nil
@@ -225,15 +208,15 @@ end
 
 -- ── Comms ─────────────────────────────────────────────────────────────────────
 -- Wire format: "<raidID>|<op>|<payload>". Ops: D = one death (name,class,deaths); ? = resync request;
--- S = full-state chunk (name,class,deaths;...); H = presence ping (payload = sender version), used to
--- count how many addons are in sync. Messages for a different RaidID are ignored. Merge is by max per
--- player, so duplicate/out-of-order/chunked S messages all converge safely.
+-- S = full-state chunk (name,class,deaths;...); H = presence ping (payload = sender version). Messages
+-- for a different RaidID are ignored. Merge is by MAX, so duplicate, reordered and chunked messages all
+-- converge safely.
 
--- Register our addon-message prefix. Registering ONCE at load is not enough: the client can drop the
--- registration mid-session (seen live in SSC, two bosses in), after which we still SEND fine but receive
--- nothing, every peer ages out and the sync count falls to 1 on every client at once until someone
--- /reloads. The call is idempotent and client-side only (no traffic), so we re-assert it cheaply on
--- zone-in and on the heartbeat cadence, which self-heals within HEARTBEAT + PEER_STALE with no reload.
+-- Registering ONCE at load is not enough: the client can drop the registration mid-session (seen live in
+-- SSC, two bosses in), after which we still SEND fine but receive nothing, every peer ages out and the
+-- sync count falls to 1 on every client at once until someone /reloads. The call is idempotent and
+-- client-side only, so re-asserting on zone-in and on the heartbeat self-heals within
+-- HEARTBEAT + PEER_STALE with no reload.
 local function EnsurePrefix()
     if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
         C_ChatInfo.RegisterAddonMessagePrefix(COMM_PREFIX)
@@ -255,19 +238,13 @@ function RDC.BroadcastDeath(name, class, deaths)
     SendComm(DB.currentRaidID .. "|D|" .. name .. "," .. (class or "") .. "," .. deaths)
 end
 
--- Ask peers for their full state for our current raid (on join / zone-in / late arrival).
 local function RequestResync()
     if not DB.currentRaidID then return end
     SendComm(DB.currentRaidID .. "|?|")
 end
 
 -- ── Peer presence (the "in sync" count) ───────────────────────────────────────
--- Every client running RDC announces itself (op H, payload = version). We keep a table of the senders
--- we have recently heard from and count them (+ ourselves) to show how many addons are in sync. Scoped
--- to our RaidID like everything else, so it counts only peers syncing the SAME raid.
-
--- Announce our presence + version. Same triggers as RequestResync, plus a periodic heartbeat, so late
--- joiners / reloads are discovered and peers who leave or disconnect age out of the count.
+-- Scoped to our RaidID like every other op, so the count only ever includes peers syncing the SAME raid.
 local function AnnouncePresence()
     if not DB.currentRaidID then return end
     SendComm(DB.currentRaidID .. "|H|" .. RDC.GetVersion())
@@ -280,14 +257,13 @@ local function IsSelf(sender)
     return short ~= nil and short == UnitName("player")
 end
 
--- Note that we just heard from a peer (any op keeps them alive; H also carries their version).
+-- Any op keeps a peer alive; only H carries a version, so retain the last one we saw.
 local function TouchPeer(sender, op, payload)
     if IsSelf(sender) then return end
     local ver = (op == "H" and payload and payload ~= "" and payload) or (peers[sender] and peers[sender].ver)
     peers[sender] = { t = time(), ver = ver }
 end
 
--- Count OTHER live peers, pruning any that have gone silent past PEER_STALE.
 local function LivePeerCount()
     local now, n = time(), 0
     for name, p in pairs(peers) do
@@ -296,12 +272,10 @@ local function LivePeerCount()
     return n
 end
 
--- How many addons are in sync right now (us + live peers). Always at least 1 (ourselves).
 function RDC.GetSyncCount()
     return 1 + LivePeerCount()
 end
 
--- Live peers as a sorted list of { name, ver } for the HUD tooltip (excludes ourselves).
 function RDC.GetSyncPeers()
     local now, out = time(), {}
     for name, p in pairs(peers) do
@@ -311,14 +285,14 @@ function RDC.GetSyncPeers()
     return out
 end
 
--- Reply to a resync request with our full state, packed into <=MSG_MAX chunks (throttled).
+-- Throttled, and split into <=MSG_MAX chunks since an addon message caps around 255 bytes.
 local function SendFullState()
     if not DB.currentRaidID then return end
     if time() - lastSyncReply < SYNC_THROTTLE then return end
-    -- Validate our lockout before answering. This is the one path that can undo somebody else's correct
-    -- reset: if the weekly reset lands while we are both online and the asker has already zeroed, a reply
-    -- built from our not-yet-checked session would heal last week's counts straight back onto them (merge
-    -- is by MAX, so the higher number always wins). Checking here means we cannot be the stale one.
+    -- The one path that can undo somebody else's correct reset: if the weekly reset lands while we are
+    -- both online and the asker has already zeroed, a reply built from our not-yet-checked session heals
+    -- last week's counts straight back onto them, since merge is by MAX. Check first so we cannot be the
+    -- stale one.
     CheckActiveLockout()
     local s = ActiveSession()
     if not s then return end
@@ -339,11 +313,11 @@ local function SendFullState()
     return flushed
 end
 
--- Parse and apply an inbound message. Ignores anything for a raid other than our current one.
+-- Anything for a raid other than our current one is dropped.
 local function OnComm(msg, sender)
     local rid, op, payload = msg:match("^(.-)|(.-)|(.*)$")
     if not rid or rid ~= DB.currentRaidID then return end
-    TouchPeer(sender, op, payload)                       -- any op from a peer keeps them in the sync count
+    TouchPeer(sender, op, payload)
     if op == "D" then
         local name, class, deaths = payload:match("^(.-),(.-),(%d+)$")
         if name and ApplyRemote(name, class, tonumber(deaths)) then RefreshHUD() end
@@ -356,21 +330,21 @@ local function OnComm(msg, sender)
     elseif op == "?" then
         SendFullState()
     elseif op == "H" then
-        RefreshHUD()                                     -- a new/refreshed peer may change the sync count
+        RefreshHUD()                                     -- a new or returning peer changes the sync count
     end
 end
 
 -- ── Death sweep (poll) ────────────────────────────────────────────────────────
--- UnitIsDeadOrGhost is synced for group members regardless of range, so an alive->dead edge is a death.
--- A poll (vs health events) is used so a death across the map is never missed for units we can see; any
--- remaining gap is filled by peers' broadcasts. Feign Death is guarded out.
+-- UnitIsDeadOrGhost is synced for group members regardless of range, so an alive->dead edge is a death and
+-- a death across the map is never missed. That is why this polls rather than driving off health events.
+-- Any remaining gap is filled by peers' broadcasts.
 
 local function Sweep()
     if not DB.currentRaidID then return end
-    if not InRaidInstance() then wasInRaid = false; return end   -- only count while inside the raid instance
+    if not InRaidInstance() then wasInRaid = false; return end
     if not wasInRaid then
         wasInRaid = true
-        wipe(prevDead)   -- just entered: re-baseline so any already-dead state (incl. a world death we
+        wipe(prevDead)   -- re-baseline on entry so already-dead state (including a world death we
                          -- corpse-walked in with) is recorded, not counted as a fresh death this tick
     end
     for _, unit in ipairs(watched) do
@@ -379,7 +353,7 @@ local function Sweep()
             local dead = UnitIsDeadOrGhost(unit) and not (UnitIsFeignDeath and UnitIsFeignDeath(unit))
             local was = prevDead[name]
             if was == nil then
-                prevDead[name] = dead            -- baseline only, never counts (we didn't witness it)
+                prevDead[name] = dead            -- first sight: baseline only, we did not witness it
             elseif dead and not was then
                 prevDead[name] = true
                 RecordDeath(name, select(2, UnitClass(unit)))
@@ -392,7 +366,6 @@ end
 
 -- ── RaidID transitions ────────────────────────────────────────────────────────
 
--- Copy one session's counts into another, merging by MAX per player (same rule sync uses).
 local function MergeSession(from, to)
     for name, p in pairs(from.players) do
         local q = to.players[name]
@@ -402,8 +375,8 @@ local function MergeSession(from, to)
     end
 end
 
--- Is `s` the SAME physical raid we are standing in right now? Match on the stable instance mapID first
--- (sessions written by newer code carry it), falling back to the instance name for older sessions.
+-- mapID is the stable identity; the name compare is only a fallback for sessions written before mapID
+-- was stored. Used solely by the legacy key migration below.
 local function SameInstance(s, iname, mapID)
     if not s then return false end
     if s.mapID and mapID and s.mapID == mapID then return true end
@@ -411,19 +384,15 @@ local function SameInstance(s, iname, mapID)
 end
 
 -- ── Lockout tracking: the automatic per-reset wipe ────────────────────────────
--- The RaidID is the instance mapID, which every client agrees on but which does NOT change when the
--- lockout resets, so the fresh-week wipe that used to fall out of a changing key now has to be detected
--- explicitly. The lockout is therefore kept as session METADATA rather than as part of the key. Two
--- signals, both read from the server's own saved-instance data, so every client reaches the same verdict
--- independently with no comms, no message ordering and nobody holding authority:
+-- The mapID key does not change when the lockout resets, so the fresh-week wipe has to be detected
+-- explicitly. Two signals, both derived from the server's saved-instance data, so every client reaches
+-- the same verdict independently with no comms, no ordering and nobody holding authority:
 --   1. the lockout the counts were recorded under has passed its reset time (the weekly reset)
---   2. we are saved to a DIFFERENT lockout id than the one they were recorded under (we raided again
---      after a reset and got saved anew)
--- Neither can misfire on a blank saved-instance read, which is what made the old lock:/map: demotion so
--- delicate: (1) reads only stored data, and (2) requires a real id in hand. Hence no grace window here.
--- KNOWN GAP: a session that never saw a boss kill was never saved, so it carries no lockout stamp and
--- neither signal can fire; its counts survive into the following week. That needs a whole raid night with
--- zero kills to hit, and /rdc reset clears it.
+--   2. we are saved to a DIFFERENT lockout id than the one they were recorded under (raided again)
+-- Neither can misfire on a blank saved-instance read, hence no grace window: (1) reads only stored data,
+-- (2) needs a real id in hand.
+-- KNOWN GAP: a session that never saw a boss kill was never saved, carries no stamp, and so survives into
+-- the following week. Needs a whole night with zero kills to hit; /rdc reset clears it.
 local function CheckLockout(s, iname)
     if not s then return end
     local id, resetIn = FindLockout(iname or s.instance)
@@ -437,25 +406,23 @@ local function CheckLockout(s, iname)
         wipe(s.players)
         s.started = now
         s.lockID, s.lockResetAt = nil, nil
-        wipe(prevDead)                    -- counts restart, so the death baselines have to as well
+        wipe(prevDead)                    -- counts restart, so the baselines have to as well
         RefreshHUD()
         print(("|cff88bbffRaid Death Count|r new lockout for %s: counts reset."):format(
             tostring(s.instance or iname or "this raid")))
     end
 
-    -- Stamp the lockout we are saved to now. This also re-stamps a session we just wiped, so the fresh
-    -- counts are anchored to the current reset. resetIn is a countdown, so store it as an absolute time.
+    -- Also re-stamps a session we just wiped, anchoring the fresh counts to the current reset. resetIn is
+    -- a countdown, so store it as an absolute time.
     if id then
         s.lockID = id
         if resetIn and resetIn > 0 then s.lockResetAt = now + resetIn end
     end
 end
 
--- Run the lockout check on the active session from wherever we happen to be standing. The saved-instance
--- list is global and the session remembers its own instance name, so this works from town, and it has to:
--- a client that logs in outside the raid must zero a stale session BEFORE it can answer a peer's resync
--- with last week's counts, since merge is by MAX and one stale reply would heal those numbers straight
--- back onto everyone who had correctly reset.
+-- Works from anywhere, not just inside the raid: the saved-instance list is global and the session
+-- remembers its own instance name. It has to, because a client logging in outside the raid must zero a
+-- stale session BEFORE it can answer a peer's resync with last week's counts.
 function CheckActiveLockout()   -- assigns the forward-declared local up top, do not make this a new local
     CheckLockout(ActiveSession(), nil)
 end
@@ -472,18 +439,18 @@ local function UpdateRaidID()
         DB.currentRaidID = rid
         local newS = EnsureSession(rid, iname, mapID)
 
-        -- Legacy key migration. Versions up to 0.3.x keyed the session on the server lockout ("lock:<id>")
-        -- whenever they could resolve one. Standing in that same instance under the mapID key is the SAME
-        -- raid, not a new one, so carry the counts over (by MAX) and adopt the old key's lockout id as the
-        -- session's stamp so expiry detection stays continuous. No lock: key is ever minted again, so this
-        -- fires at most once per stranded session and can be deleted once nobody is upgrading from 0.3.x.
+        -- Legacy key migration. Versions up to 0.3.x keyed the session on the lockout ("lock:<id>").
+        -- Standing in that same instance under the mapID key is the SAME raid, so carry the counts over by
+        -- MAX and adopt the old key's id as the stamp, keeping expiry detection continuous. No lock: key
+        -- is minted any more, so this fires at most once per stranded session and can be deleted once
+        -- nobody is upgrading from 0.3.x.
         if oldID and oldID:match("^lock:") and SameInstance(oldS, iname, mapID) then
             MergeSession(oldS, newS)
             newS.lockID = newS.lockID or tonumber(oldID:match("^lock:(%d+)"))
             DB.sessions[oldID] = nil
         end
 
-        wipe(prevDead)               -- new raid context: drop stale baselines (re-baselined next sweep)
+        wipe(prevDead)               -- new raid context: re-baselined on the next sweep
         PruneSessions(10)
         CheckLockout(newS, iname)
         RequestResync()
@@ -512,11 +479,11 @@ local function ReportLine(text)
     if ch then
         SendChatMessage(text, ch)
     else
-        print("|cff88bbffRaidDeathCount|r " .. text)   -- solo: print locally
+        print("|cff88bbffRaidDeathCount|r " .. text)
     end
 end
 
--- mode = "all" | "top3" | "top5" | a player name. Posts to raid/party (or prints solo).
+-- mode = "all" | "top3" | "top5" | a player-name prefix.
 function RDC.Report(mode)
     local snap = RDC.GetSnapshot()
     if #snap == 0 then ReportLine("No deaths recorded yet.") return end
@@ -542,7 +509,8 @@ function RDC.Report(mode)
     end
 end
 
--- Clear the current raid's counts.
+-- Local only. In a group a peer's next D or S heals the counts back by MAX, so this is a solo convenience,
+-- not a group reset. See CLAUDE.md for why there is no group reset.
 function RDC.ResetCurrent()
     if not DB or not DB.currentRaidID then return end
     local s = DB.sessions[DB.currentRaidID]
@@ -565,19 +533,18 @@ frame:RegisterEvent("UPDATE_INSTANCE_INFO")   -- the saved-instance list arrived
 frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     if event == "ADDON_LOADED" then
         if arg1 ~= ADDON_NAME then return end
-        -- Account-wide: UI preferences only, so the HUD keeps its size/place on every character.
+        -- Account-wide: UI preferences only, so the HUD keeps its size and place on every character.
         RaidDeathCountDB = RaidDeathCountDB or {}
         RaidDeathCountDB.hud = RaidDeathCountDB.hud or {}
         RaidDeathCountDB.minimap = RaidDeathCountDB.minimap or {}
-        -- Death data is PER CHARACTER: an alt that never set foot in the raid must not inherit the
-        -- main's counts or its sticky currentRaidID. Walking that alt into the same raid still fills
-        -- the counts back in from peers (comms are scoped by RaidID, merged by MAX), which is correct:
-        -- the counts belong to the raid, the storage belongs to the character.
+        -- Per character: an alt that never set foot in the raid must not inherit the main's counts or its
+        -- sticky currentRaidID. Walking that alt into the same raid does refill from peers, which is
+        -- intended: counts belong to the raid, storage belongs to the character.
         RaidDeathCountCharDB = RaidDeathCountCharDB or {}
         DB = RaidDeathCountCharDB
         DB.sessions = DB.sessions or {}
-        -- Pre-0.3 sessions were account-wide. They cannot be attributed to a character now, so rather
-        -- than handing every alt the main's history we drop them; the active run re-syncs from peers.
+        -- Pre-0.3 sessions were account-wide and cannot be attributed to a character, so drop them rather
+        -- than hand every alt the main's history. A mid-lockout upgrade re-syncs from peers.
         RaidDeathCountDB.sessions = nil
         RaidDeathCountDB.currentRaidID = nil
         EnsurePrefix()
@@ -589,7 +556,7 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         -- Before any comms: a session left over from an expired lockout has to be zeroed now, or our
         -- first resync reply would push last week's counts onto peers who had already reset.
         CheckActiveLockout()
-        if RequestRaidInfo then RequestRaidInfo() end   -- warm the saved-instance list (UPDATE_INSTANCE_INFO)
+        if RequestRaidInfo then RequestRaidInfo() end   -- warms the list, fires UPDATE_INSTANCE_INFO
         if RDC.InitHUD then RDC.InitHUD() end
         if RDC.InitMinimap then RDC.InitMinimap() end
         RequestResync()
@@ -597,7 +564,7 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         print(("|cff88bbffRaid Death Count|r v%s loaded. Enjoy!"):format(RDC.GetVersion()))
 
     elseif event == "PLAYER_ENTERING_WORLD" then
-        EnsurePrefix()        -- before the resync/presence below, so the replies are actually heard
+        EnsurePrefix()        -- before the resync and presence below, or the replies are not heard
         RebuildWatched()
         UpdateRaidID()
         CheckActiveLockout()
@@ -618,30 +585,25 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     end
 end)
 
--- Death poll: only sweeps while we have an active raid context.
 local acc = 0
 frame:SetScript("OnUpdate", function(_, elapsed)
     acc = acc + elapsed
     if acc < POLL_INTERVAL then return end
     acc = 0
     if DB and DB.currentRaidID then
-        UpdateRaidID()   -- re-resolve on a steady cadence so the demotion grace window elapses even when
-                         -- GROUP_ROSTER_UPDATE is quiet (e.g. single-client testing); cheap on no change
+        UpdateRaidID()   -- steady cadence picks up a zone change and runs CheckLockout even when
+                         -- GROUP_ROSTER_UPDATE is quiet; cheap when nothing has changed
         Sweep()
-        -- Presence heartbeat + age-out: ping every HEARTBEAT secs, and if the live peer count changed
-        -- (someone joined, reloaded, or went silent) repaint so the HUD's sync number stays current.
         local now = time()
         if now - lastHeartbeat >= HEARTBEAT then
             lastHeartbeat = now
             EnsurePrefix()   -- re-assert: a silently dropped registration otherwise needs a /reload
-            -- Lockout safety net. UpdateRaidID only checks while we are standing in the raid, so a client
-            -- parked in town across the weekly reset would otherwise keep last week's counts until it
-            -- zoned or relogged. This runs anywhere, so everyone converges within HEARTBEAT of the reset.
+            -- Safety net for a client parked in town across the weekly reset, which would otherwise keep
+            -- last week's counts until it zoned or relogged. Converges everyone within HEARTBEAT.
             CheckActiveLockout()
             AnnouncePresence()
-            -- Grouped but hearing nobody: either we are the only user here (a harmless extra ping) or we
-            -- just went deaf and missed their broadcasts, so pull full state back in. Merge is by MAX, so
-            -- a redundant resync costs one message and changes nothing.
+            -- Grouped but hearing nobody means either we are the only user here or we just went deaf and
+            -- missed their broadcasts. Merge is by MAX, so a redundant resync costs one message.
             if IsInGroup() and LivePeerCount() == 0 then RequestResync() end
         end
         local c = LivePeerCount()
@@ -650,17 +612,15 @@ frame:SetScript("OnUpdate", function(_, elapsed)
 end)
 
 -- ── Debug ─────────────────────────────────────────────────────────────────────
--- /run RaidDeathCount.DebugDump() prints RaidID resolution + the current snapshot (for in-game tuning).
+-- /run RaidDeathCount.DebugDump()
 function RDC.DebugDump()
     local iname, itype, _, _, _, _, _, mapID = GetInstanceInfo()
     print("|cff88bbffRDC|r instance:", iname, "type:", itype, "mapID:", mapID)
     local rid = ResolveRaidID()
     print("|cff88bbffRDC|r ResolveRaidID:", tostring(rid), "  active:", tostring(DB and DB.currentRaidID))
-    -- Lockout is metadata now, not part of the key, but it drives the automatic per-reset wipe, so show
-    -- both what we resolve right now and what the active session was stamped with.
     local s = ActiveSession()
-    -- Outside an instance iname is just the zone name, so fall back to the session's own instance: that
-    -- is what CheckLockout uses from town, and the dump should show the same thing it acts on.
+    -- Outside an instance iname is just the zone name, so fall back to the session's own instance: that is
+    -- what CheckLockout uses from town, and the dump should show what it acts on.
     local lid, lreset = FindLockout((itype == "raid" and iname) or (s and s.instance))
     print(("|cff88bbffRDC|r lockout now: id=%s resetIn=%s   session: id=%s resetAt=%s (%s)"):format(
         tostring(lid), tostring(lreset), tostring(s and s.lockID), tostring(s and s.lockResetAt),
@@ -674,7 +634,7 @@ function RDC.DebugDump()
     for _, e in ipairs(RDC.GetSnapshot()) do
         print(("  %s (%s): %d"):format(e.name, tostring(e.class), e.deaths))
     end
-    -- Every stored session, so a stranded/orphaned raidID's counts are visible (not just the active one).
+    -- All sessions, so a stranded raidID's counts are visible and not just the active one's.
     print("|cff88bbffRDC|r sessions in DB:")
     for id, sess in pairs(DB and DB.sessions or {}) do
         local total, np = 0, 0
@@ -685,8 +645,8 @@ function RDC.DebugDump()
     end
 end
 
--- Recovery: MAX-merge a stranded session's counts into the active one, then drop the source. Manual, for
--- reclaiming counts orphaned by an old bug: /run RaidDeathCount.DebugRecover("map:550")
+-- Manual recovery for counts orphaned by an old RaidID bug:
+-- /run RaidDeathCount.DebugRecover("map:550")
 function RDC.DebugRecover(fromID)
     if not DB or not DB.currentRaidID then print("|cff88bbffRDC|r no active raid"); return end
     local from = DB.sessions[fromID]
