@@ -21,6 +21,8 @@ local PAD      = 4
 local MIN_W, MIN_H = 150, 60
 local MAX_W, MAX_H = 500, 700
 local DEF_W, DEF_H = 220, 200
+local SCROLL_W  = 6    -- scrollbar gutter, only reserved while the bar is shown
+local THUMB_MIN = 16   -- keeps the thumb grabbable on a long list
 
 local CLASS_TEX = "Interface\\Glues\\CharacterCreate\\UI-CharacterCreate-Classes"
 
@@ -71,14 +73,9 @@ local function SavePlacement()
 end
 
 hud:SetMovable(true)
+-- Mouse stays enabled with no drag handler so the body swallows clicks rather than passing them through
+-- to the world behind it. Dragging is wired to the header alone, below.
 hud:EnableMouse(true)
-hud:RegisterForDrag("LeftButton")
-hud:SetScript("OnDragStart", function(self)
-    local db = DB()
-    if db and db.locked then return end
-    self:StartMoving()
-end)
-hud:SetScript("OnDragStop", function(self) self:StopMovingOrSizing(); SavePlacement() end)
 
 -- ── Header (title + lock + close) ─────────────────────────────────────────────
 local header = CreateFrame("Frame", nil, hud, "BackdropTemplate")
@@ -86,6 +83,17 @@ header:SetPoint("TOPLEFT", hud, "TOPLEFT", PAD, -PAD)
 header:SetPoint("TOPRIGHT", hud, "TOPRIGHT", -PAD, -PAD)
 header:SetHeight(HEADER_H)
 ApplyFlat(header, THEME.panel, true)
+
+-- Drag by the title bar only. The header's buttons are child frames and consume their own clicks, so
+-- grabbing one of those does not start a move.
+header:EnableMouse(true)
+header:RegisterForDrag("LeftButton")
+header:SetScript("OnDragStart", function()
+    local db = DB()
+    if db and db.locked then return end
+    hud:StartMoving()
+end)
+header:SetScript("OnDragStop", function() hud:StopMovingOrSizing(); SavePlacement() end)
 
 local title = header:CreateFontString(nil, "OVERLAY")
 ApplyFont(title, 12)
@@ -189,21 +197,44 @@ local function UpdateSyncTag()
     end
 end
 
+-- Summarised by version rather than listing every peer: a full 25-man of addon users would otherwise be
+-- 26 lines of names that all say the same thing. Only the peers NOT matching our version are named, since
+-- that is the half you can act on, and even that list is capped.
+local ODD_CAP = 8
+
 syncTag:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
-    local ver = RDC.GetVersion and RDC.GetVersion() or "?"
-    local peers = RDC.GetSyncPeers and RDC.GetSyncPeers() or {}
-    GameTooltip:SetText("Addons in sync: " .. (RDC.GetSyncCount and RDC.GetSyncCount() or 1))
-    GameTooltip:AddLine("You  |cff888888v" .. ver .. "|r", 0.5, 0.9, 0.5)
+    local ver = (RDC.GetVersion and RDC.GetVersion()) or "?"
+    local peers = (RDC.GetSyncPeers and RDC.GetSyncPeers()) or {}
+    GameTooltip:SetText("Addons in sync: " .. ((RDC.GetSyncCount and RDC.GetSyncCount()) or 1))
+
+    if #peers == 0 then
+        GameTooltip:AddLine("No one else is running the addon.", 0.6, 0.6, 0.6, true)
+        GameTooltip:Show()
+        return
+    end
+
+    local matching, odd = 1, {}   -- starts at 1 for ourselves
     for _, p in ipairs(peers) do
-        local short = p.name:match("^[^-]+") or p.name
-        if p.ver and p.ver ~= ver then
-            GameTooltip:AddLine(short .. "  |cffd9a066v" .. p.ver .. "|r", 0.8, 0.8, 0.8)   -- version mismatch
-        else
-            GameTooltip:AddLine(short, 0.8, 0.8, 0.8)
+        if p.ver == ver then matching = matching + 1 else odd[#odd + 1] = p end
+    end
+
+    if #odd == 0 then
+        GameTooltip:AddLine(("All on v%s"):format(ver), 0.5, 0.9, 0.5)
+    else
+        GameTooltip:AddLine(("%d on v%s (yours)"):format(matching, ver), 0.5, 0.9, 0.5)
+        GameTooltip:AddLine(("%d on other versions:"):format(#odd), 0.8, 0.8, 0.8)
+        for i = 1, math.min(#odd, ODD_CAP) do
+            local p = odd[i]
+            -- A peer heard via any op but not yet via H has no version recorded, so show "?" rather than
+            -- claiming a version we were never told. The 30s heartbeat resolves it shortly.
+            GameTooltip:AddLine(("   %s  |cffd9a066v%s|r"):format(
+                p.name:match("^[^-]+") or p.name, p.ver or "?"), 0.8, 0.8, 0.8)
+        end
+        if #odd > ODD_CAP then
+            GameTooltip:AddLine(("   + %d more"):format(#odd - ODD_CAP), 0.6, 0.6, 0.6)
         end
     end
-    if #peers == 0 then GameTooltip:AddLine("No one else is running the addon.", 0.6, 0.6, 0.6, true) end
     GameTooltip:Show()
 end)
 syncTag:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -237,6 +268,96 @@ emptyText:SetPoint("TOP", body, "TOP", 0, -6)
 emptyText:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
 emptyText:SetText("No deaths recorded")
 
+-- ── Scrolling ─────────────────────────────────────────────────────────────────
+-- The row pool renders a WINDOW into the snapshot: slot n shows snap[n + scrollOffset]. Only the offset
+-- moves, so the pool stays bounded by what fits the body rather than by raid size. Offset is view state
+-- and deliberately not persisted.
+local scrollOffset = 0
+
+local scrollTrack = CreateFrame("Frame", nil, body, "BackdropTemplate")
+scrollTrack:SetWidth(SCROLL_W)
+scrollTrack:SetPoint("TOPRIGHT", body, "TOPRIGHT", 0, 0)
+scrollTrack:SetPoint("BOTTOMRIGHT", body, "BOTTOMRIGHT", 0, 0)
+ApplyFlat(scrollTrack, THEME.panel, false)
+scrollTrack:Hide()
+
+local scrollThumb = CreateFrame("Frame", nil, scrollTrack, "BackdropTemplate")
+scrollThumb:SetWidth(SCROLL_W)
+scrollThumb:SetHeight(THUMB_MIN)
+scrollThumb:SetPoint("TOP", scrollTrack, "TOP", 0, 0)
+ApplyFlat(scrollThumb, THEME.dim, false)
+scrollThumb:EnableMouse(true)
+
+local function ThumbColor(c)
+    if scrollThumb.SetBackdropColor then scrollThumb:SetBackdropColor(c[1], c[2], c[3], c[4] or 1) end
+end
+
+local function VisibleRows()
+    return math.max(0, math.floor(body:GetHeight() / ROW_H))
+end
+
+local function MaxScrollOffset(total)
+    return math.max(0, total - VisibleRows())
+end
+
+-- Sizes and places the thumb for the current offset. Returns whether the bar is showing, so the caller
+-- can inset the rows and keep the count text clear of it.
+local function UpdateScrollBar(total, visible)
+    if visible <= 0 or total <= visible then
+        scrollTrack:Hide()
+        return false
+    end
+    scrollTrack:Show()
+    local trackH = scrollTrack:GetHeight()
+    local thumbH = math.min(trackH, math.max(THUMB_MIN, trackH * (visible / total)))
+    scrollThumb:SetHeight(thumbH)
+    local maxOff = total - visible
+    local progress = (maxOff > 0) and (scrollOffset / maxOff) or 0
+    scrollThumb:ClearAllPoints()
+    scrollThumb:SetPoint("TOP", scrollTrack, "TOP", 0, -progress * (trackH - thumbH))
+    return true
+end
+
+local function ScrollTo(offset)
+    local want = math.max(0, math.min(MaxScrollOffset(#RDC.GetSnapshot()), offset))
+    if want == scrollOffset then return end
+    scrollOffset = want
+    RDC.RefreshHUD()
+end
+
+hud:EnableMouseWheel(true)
+hud:SetScript("OnMouseWheel", function(_, delta) ScrollTo(scrollOffset - delta) end)
+
+-- Cursor-to-thumb-top distance captured on mouse down, so grabbing mid-thumb does not snap it.
+local dragGrab = nil
+
+local function ThumbDragUpdate(self)
+    -- OnMouseUp only arrives if the release happens over the thumb, so poll the button instead: a drag
+    -- that ends off-frame has to let go too.
+    if not IsMouseButtonDown("LeftButton") then
+        dragGrab = nil
+        self:SetScript("OnUpdate", nil)
+        if not self:IsMouseOver() then ThumbColor(THEME.dim) end
+        return
+    end
+    local span = scrollTrack:GetHeight() - self:GetHeight()
+    if span <= 0 then return end
+    local _, cursorY = GetCursorPosition()
+    cursorY = cursorY / scrollTrack:GetEffectiveScale()
+    local progress = math.max(0, math.min(1, ((scrollTrack:GetTop() - cursorY) - dragGrab) / span))
+    ScrollTo(math.floor(progress * MaxScrollOffset(#RDC.GetSnapshot()) + 0.5))
+end
+
+scrollThumb:SetScript("OnMouseDown", function(self)
+    local _, cursorY = GetCursorPosition()
+    dragGrab = self:GetTop() - (cursorY / self:GetEffectiveScale())
+    ThumbColor(THEME.accent)
+    self:SetScript("OnUpdate", ThumbDragUpdate)
+end)
+scrollThumb:SetScript("OnEnter", function() ThumbColor(THEME.accent) end)
+scrollThumb:SetScript("OnLeave", function() if not dragGrab then ThumbColor(THEME.dim) end end)
+
+-- ── Rows ──────────────────────────────────────────────────────────────────────
 local ROW_POOL = 40
 local rows = {}
 
@@ -289,20 +410,31 @@ end
 function RDC.RefreshHUD()
     if not hud:IsShown() then return end
     local snap = RDC.GetSnapshot()
+    local total = #snap
+    -- The divisor stays the overall leader, not the top VISIBLE row, or bar widths would rescale as you
+    -- scroll and stop being comparable between screenfuls.
     local top = (snap[1] and snap[1].deaths) or 1
-    local bodyW = math.max(1, body:GetWidth())
-    local maxRows = math.max(0, math.floor(body:GetHeight() / ROW_H))
+    local maxRows = VisibleRows()
 
-    emptyText:SetShown(#snap == 0)
+    -- Clamp before rendering: a shrinking list, or a resize that reveals more rows, must not leave the
+    -- view stranded past the end.
+    if scrollOffset > math.max(0, total - maxRows) then scrollOffset = math.max(0, total - maxRows) end
 
-    for i = 1, ROW_POOL do
-        local e = snap[i]
-        if e and i <= maxRows then
-            local row = rows[i]
-            if not row then row = MakeRow(i); rows[i] = row end
+    emptyText:SetShown(total == 0)
+
+    local scrolling = UpdateScrollBar(total, maxRows)
+    local rowInset = scrolling and -(SCROLL_W + 2) or 0
+    local rowW = math.max(1, body:GetWidth() + rowInset)
+
+    for slot = 1, ROW_POOL do
+        local index = slot + scrollOffset
+        local e = (slot <= maxRows) and snap[index] or nil
+        if e then
+            local row = rows[slot]
+            if not row then row = MakeRow(slot); rows[slot] = row end
             row:ClearAllPoints()
-            row:SetPoint("TOPLEFT", body, "TOPLEFT", 0, -(i - 1) * ROW_H)
-            row:SetPoint("RIGHT", body, "RIGHT", 0, 0)
+            row:SetPoint("TOPLEFT", body, "TOPLEFT", 0, -(slot - 1) * ROW_H)
+            row:SetPoint("RIGHT", body, "RIGHT", rowInset, 0)
 
             local c = RAID_CLASS_COLORS and e.class and RAID_CLASS_COLORS[e.class]
             local r, g, b = 0.4, 0.4, 0.4
@@ -310,7 +442,7 @@ function RDC.RefreshHUD()
 
             -- Proportional to the leader's count, floored at a sliver so a 1-death bar is still visible.
             local frac = math.max(0.12, e.deaths / top)
-            row.bar:SetWidth(bodyW * frac)
+            row.bar:SetWidth(rowW * frac)
             row.bar:SetVertexColor(r, g, b, 0.55)
 
             if e.class and CLASS_ICON_TCOORDS and CLASS_ICON_TCOORDS[e.class] then
@@ -321,14 +453,14 @@ function RDC.RefreshHUD()
                 row.icon:Hide()
             end
 
-            row.rank:SetText(i)
+            row.rank:SetText(index)   -- absolute placing in the snapshot, not the row slot
             local shortName = e.name:match("^[^-]+") or e.name
             row.name:SetText(shortName)
             row.name:SetTextColor(r, g, b)
             row.count:SetText(e.deaths)
             row:Show()
-        elseif rows[i] then
-            rows[i]:Hide()
+        elseif rows[slot] then
+            rows[slot]:Hide()
         end
     end
 
