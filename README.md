@@ -14,8 +14,9 @@ movable, resizable Details-style HUD (class icon, name, count), sorted by deaths
   physically inside the raid instance (not out in the world or a dungeon).
 - **Sync** shares counts over addon comms (RAID/PARTY). Counts are monotonic within a raid and
   merged by MAX, so late joins, disconnects, and duplicate messages all self-heal.
-- **Raid scoping** keeps each raid's counts separate (by lockout / instance), so an old raid's
-  totals never bleed into a new one, and a fresh lockout of the same instance auto-resets to zero.
+- **Raid scoping** keeps each raid's counts separate (by instance), so an old raid's totals never
+  bleed into a new one. A fresh lockout of the same instance auto-resets to zero: every client works
+  that out from its own saved-instance data, with no sync message and nobody in charge.
 - **Counts are saved per character**, so an alt does not inherit a raid it was never in. HUD position
   and size are shared account-wide. If that alt does walk into the raid with other addon users, sync
   fills its counts back in: the counts belong to the raid, the storage belongs to the character.
@@ -51,5 +52,6 @@ so there is no manual reset to run.
 
 ## Status
 
-Working build (v0.3.1), tested in a live raid on a single client. The core, sync, and HUD are in place;
-cross-client sync verification is ongoing.
+Working build (v0.3.2). Tested in a live raid, and multi-client sync is confirmed working across two
+clients through a full evening. The automatic per-lockout reset introduced in this version has not yet
+seen a weekly reset in the wild.
