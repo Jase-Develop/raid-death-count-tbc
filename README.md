@@ -43,10 +43,3 @@ deaths. No dependencies, no setup, no configuration to get wrong.
 | `/rdc version` | Print the version. |
 
 Anything else prints the list above.
-
-## Status
-
-Working build (v0.4), tested through full raid evenings with sync confirmed across multiple clients.
-The automatic weekly-lockout reset is the one piece still waiting on a live reset to confirm.
-
-Curious about the internals? `CLAUDE.md` covers the design decisions and the constraints behind them.
