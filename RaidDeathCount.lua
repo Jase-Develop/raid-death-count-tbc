@@ -216,6 +216,17 @@ end
 -- count how many addons are in sync. Messages for a different RaidID are ignored. Merge is by max per
 -- player, so duplicate/out-of-order/chunked S messages all converge safely.
 
+-- Register our addon-message prefix. Registering ONCE at load is not enough: the client can drop the
+-- registration mid-session (seen live in SSC, two bosses in), after which we still SEND fine but receive
+-- nothing, every peer ages out and the sync count falls to 1 on every client at once until someone
+-- /reloads. The call is idempotent and client-side only (no traffic), so we re-assert it cheaply on
+-- zone-in and on the heartbeat cadence, which self-heals within HEARTBEAT + PEER_STALE with no reload.
+local function EnsurePrefix()
+    if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
+        C_ChatInfo.RegisterAddonMessagePrefix(COMM_PREFIX)
+    end
+end
+
 local function SendComm(msg)
     local ch = GroupChannel()
     if not ch then return end
@@ -509,9 +520,7 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         -- than handing every alt the main's history we drop them; the active run re-syncs from peers.
         RaidDeathCountDB.sessions = nil
         RaidDeathCountDB.currentRaidID = nil
-        if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
-            C_ChatInfo.RegisterAddonMessagePrefix(COMM_PREFIX)
-        end
+        EnsurePrefix()
 
     elseif event == "PLAYER_LOGIN" then
         playerName = FullName("player")
@@ -524,6 +533,7 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         print(("|cff88bbffRaid Death Count|r v%s loaded. Enjoy!"):format(RDC.GetVersion()))
 
     elseif event == "PLAYER_ENTERING_WORLD" then
+        EnsurePrefix()        -- before the resync/presence below, so the replies are actually heard
         RebuildWatched()
         UpdateRaidID()
         RequestResync()
@@ -552,7 +562,15 @@ frame:SetScript("OnUpdate", function(_, elapsed)
         -- Presence heartbeat + age-out: ping every HEARTBEAT secs, and if the live peer count changed
         -- (someone joined, reloaded, or went silent) repaint so the HUD's sync number stays current.
         local now = time()
-        if now - lastHeartbeat >= HEARTBEAT then lastHeartbeat = now; AnnouncePresence() end
+        if now - lastHeartbeat >= HEARTBEAT then
+            lastHeartbeat = now
+            EnsurePrefix()   -- re-assert: a silently dropped registration otherwise needs a /reload
+            AnnouncePresence()
+            -- Grouped but hearing nobody: either we are the only user here (a harmless extra ping) or we
+            -- just went deaf and missed their broadcasts, so pull full state back in. Merge is by MAX, so
+            -- a redundant resync costs one message and changes nothing.
+            if IsInGroup() and LivePeerCount() == 0 then RequestResync() end
+        end
         local c = LivePeerCount()
         if c ~= lastSyncCount then lastSyncCount = c; RefreshHUD() end
     end
