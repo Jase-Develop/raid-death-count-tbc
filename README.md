@@ -26,8 +26,11 @@ movable, resizable Details-style HUD (class icon, name, count), sorted by deaths
 - Details-style rows (rank, class icon, name, count) with a class-coloured bar, sorted by deaths.
 - Header controls (right to left): close, a pin/lock toggle for move + resize, report buttons
   **A** / **3** / **5** (report all / top 3 / top 5 to chat), and a sync indicator showing how many
-  addons are in sync (hover it to see who).
-- Movable and resizable (drag the frame, or the bottom-right grip) when unlocked.
+  addons are in sync (hover it for a version breakdown).
+- **Scrolls** when there are more players than fit: mouse wheel over the frame, or drag the scrollbar.
+  The bar only appears when there is something to scroll to, so keep the HUD small if you prefer.
+- Movable by the **title bar** and resizable by the bottom-right grip, when unlocked. Clicking a row
+  does not move the frame.
 - A minimap button (skull) toggles the HUD; drag it around the ring to reposition.
 
 ## Installation
@@ -52,6 +55,6 @@ so there is no manual reset to run.
 
 ## Status
 
-Working build (v0.3.2). Tested in a live raid, and multi-client sync is confirmed working across two
-clients through a full evening. The automatic per-lockout reset introduced in this version has not yet
-seen a weekly reset in the wild.
+Working build (v0.4). Tested in a live raid, and multi-client sync is confirmed working across two
+clients through a full evening. Two things are still awaiting a live raid: the automatic per-lockout
+reset added in 0.3.2, which cannot be confirmed until a weekly reset lands, and the HUD changes in 0.4.
