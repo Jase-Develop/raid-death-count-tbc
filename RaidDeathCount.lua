@@ -257,11 +257,47 @@ local function IsSelf(sender)
     return short ~= nil and short == UnitName("player")
 end
 
+-- ── Update notice ─────────────────────────────────────────────────────────────
+-- Peers announce their version in every H ping, so a newer one in the raid is a free update check with
+-- no web request and no version file to maintain.
+
+-- Dotted versions compared component by component AS NUMBERS. A plain string compare gets "0.10" < "0.9"
+-- backwards, and it fails by staying silent, so the bug would not show up until a 0.10 shipped. gmatch on
+-- digits also tolerates a stray "v" prefix.
+local function VersionParts(v)
+    local parts = {}
+    for n in tostring(v or ""):gmatch("%d+") do parts[#parts + 1] = tonumber(n) end
+    return parts
+end
+
+local function IsNewer(other, mine)
+    local a, b = VersionParts(other), VersionParts(mine)
+    if #a == 0 or #b == 0 then return false end   -- unparseable either side (e.g. GetVersion gave "?")
+    for i = 1, math.max(#a, #b) do
+        local x, y = a[i] or 0, b[i] or 0         -- "0.3" vs "0.3.2": missing components count as zero
+        if x ~= y then return x > y end
+    end
+    return false
+end
+
+local notifiedNewer = false   -- once per session; a reload re-arms it
+
+-- Deliberately does NOT name the version. All we know is that SOMEBODY in this raid is ahead of us, which
+-- is not the same as knowing what the latest release is: on a raid running 0.4, 0.4.5 and 0.5 we would
+-- name whichever we happened to hear first, and a 0.4 user told "0.4.5 is available" would update to it
+-- and still be behind. Reporting a number implies an authority we do not have.
+local function CheckPeerVersion(theirVer)
+    if notifiedNewer or not IsNewer(theirVer, RDC.GetVersion()) then return end
+    notifiedNewer = true
+    print("|cff88bbffRaid Death Count|r there is a new version available.")
+end
+
 -- Any op keeps a peer alive; only H carries a version, so retain the last one we saw.
 local function TouchPeer(sender, op, payload)
     if IsSelf(sender) then return end
     local ver = (op == "H" and payload and payload ~= "" and payload) or (peers[sender] and peers[sender].ver)
     peers[sender] = { t = time(), ver = ver }
+    if ver then CheckPeerVersion(ver) end
 end
 
 local function LivePeerCount()
