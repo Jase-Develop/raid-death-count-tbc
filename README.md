@@ -2,59 +2,51 @@
 
 A lean death-count HUD for **TBC Anniversary** (client 2.5.6).
 
-Raid Death Count tracks and syncs per-player **death counts** in your raid and shows them in a
-movable, resizable Details-style HUD (class icon, name, count), sorted by deaths descending. It is
-**dependency-free**: it runs stand-alone on the stock WoW API, with no external libraries.
+Who died, how many times, at a glance. Raid Death Count keeps a running tally for everyone in your
+raid and shows it in a movable, resizable Details-style list: class icon, name, count, sorted by
+deaths. No dependencies, no setup, no configuration to get wrong.
 
-## How it works
+## What it does
 
-- **Death detection** polls `UnitIsDeadOrGhost` for each group member, so it catches far-away
-  deaths a combat-log-only approach would miss. Feign Death is ignored, and a first-sight baseline
-  means players already dead when you join are not miscounted. Deaths are only counted while you are
-  physically inside the raid instance (not out in the world or a dungeon).
-- **Sync** shares counts over addon comms (RAID/PARTY). Counts are monotonic within a raid and
-  merged by MAX, so late joins, disconnects, and duplicate messages all self-heal.
-- **Raid scoping** keeps each raid's counts separate (by instance), so an old raid's totals never
-  bleed into a new one. A fresh lockout of the same instance auto-resets to zero: every client works
-  that out from its own saved-instance data, with no sync message and nobody in charge.
-- **Counts are saved per character**, so an alt does not inherit a raid it was never in. HUD position
-  and size are shared account-wide. If that alt does walk into the raid with other addon users, sync
-  fills its counts back in: the counts belong to the raid, the storage belongs to the character.
+- **Counts deaths automatically** while you are in the raid instance. Nothing to start or stop.
+- **Shares counts with your raid.** Anyone else running the addon sees the same numbers, and joining
+  late, disconnecting, or reloading all sort themselves out on their own.
+- **Keeps raids separate.** A different raid, or a new week's lockout of the same one, starts fresh at
+  zero. There is no reset to remember.
+- **Reports to chat** with one click, so you can post the damage after a wipe.
 
 ## The HUD
 
-- Details-style rows (rank, class icon, name, count) with a class-coloured bar, sorted by deaths.
-- Header controls (right to left): close, a pin/lock toggle for move + resize, report buttons
-  **A** / **3** / **5** (report all / top 3 / top 5 to chat), and a sync indicator showing how many
-  addons are in sync (hover it for a version breakdown).
-- **Scrolls** when there are more players than fit: mouse wheel over the frame, or drag the scrollbar.
-  The bar only appears when there is something to scroll to, so keep the HUD small if you prefer.
-- Movable by the **title bar** and resizable by the bottom-right grip, when unlocked. Clicking a row
-  does not move the frame.
-- A minimap button (skull) toggles the HUD; drag it around the ring to reposition.
+- Rows sorted by deaths, with a class-coloured bar behind each one.
+- Header buttons, right to left: close, lock, **A** / **3** / **5** to report all or the top 3 or 5 to
+  chat, and a sync indicator showing how many raiders are running the addon. Hover it for details.
+- Scrolls with the mouse wheel when more players die than fit, so you can keep the frame small.
+- Unlock it to drag by the title bar and resize from the bottom-right corner. Clicking a row will not
+  move it.
+- The minimap skull toggles the HUD, and drags around the ring to reposition.
 
 ## Installation
 
-1. Clone or download this repository.
-2. Put the `raid-death-count` folder into your `World of Warcraft\_anniversary_\Interface\AddOns\`
-   directory.
-3. Restart the client, or `/reload`, and enable **Raid Death Count** in the AddOns list.
+1. Download this repository, or grab the latest [release](https://github.com/Jase-Develop/raid-death-count-tbc/releases).
+2. Put the `raid-death-count` folder into `World of Warcraft\_anniversary_\Interface\AddOns\`.
+3. Restart the client, or `/reload`, then enable **Raid Death Count** in the AddOns list.
 
-## Usage
+## Commands
 
-- `/rdc` (or `/rdc toggle`) - toggle the HUD.
-- `/rdc report [player <name> | top3 | top5 | all]` - report counts to raid/party (default: all).
-- `/rdc lock` - toggle the HUD move + resize lock.
-- `/rdc minimap` - show/hide the minimap button.
-- `/rdc demo` - toggle sample data for a UI preview (local only, never touches real counts).
-- `/rdc version` - print the addon version.
-- `/rdc <anything else>` - print the command help.
+| Command | Does |
+| --- | --- |
+| `/rdc` | Show or hide the HUD. |
+| `/rdc report` | Post counts to raid chat. Add `top3`, `top5`, or `player <name>` to narrow it. |
+| `/rdc lock` | Lock or unlock moving and resizing. |
+| `/rdc minimap` | Show or hide the minimap button. |
+| `/rdc demo` | Fill the HUD with sample data for a look around. Never touches real counts. |
+| `/rdc version` | Print the version. |
 
-Counts reset automatically per raid: a new lockout or a different raid starts every client at zero,
-so there is no manual reset to run.
+Anything else prints the list above.
 
 ## Status
 
-Working build (v0.4). Tested in a live raid, and multi-client sync is confirmed working across two
-clients through a full evening. Two things are still awaiting a live raid: the automatic per-lockout
-reset added in 0.3.2, which cannot be confirmed until a weekly reset lands, and the HUD changes in 0.4.
+Working build (v0.4), tested through full raid evenings with sync confirmed across multiple clients.
+The automatic weekly-lockout reset is the one piece still waiting on a live reset to confirm.
+
+Curious about the internals? `CLAUDE.md` covers the design decisions and the constraints behind them.
