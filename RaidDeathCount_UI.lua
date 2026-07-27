@@ -399,8 +399,24 @@ local function MakeRow(i)
     return row
 end
 
--- "Coilfang: Serpentshrine Cavern" becomes "Serpentshrine Cavern"; unprefixed names pass through.
-local function ShortInstance(name)
+-- Keyed by instance mapID, not by name: the mapID is the same client-side constant the RaidID is built
+-- from, so this needs no locale handling and cannot be broken by a "Coilfang: " style prefix changing.
+local RAID_ABBR = {
+    [532] = "Karazhan",
+    [565] = "Gruul",
+    [544] = "Maggy",
+    [548] = "SSC",
+    [550] = "TK",
+    [534] = "Hyjal",
+    [564] = "BT",
+    [568] = "ZA",
+    [580] = "Sunwell",
+}
+
+-- A known raid becomes its abbreviation; anything else falls back to trimming the cluster prefix, so
+-- "Coilfang: Serpentshrine Cavern" becomes "Serpentshrine Cavern" and unprefixed names pass through.
+local function ShortInstance(name, mapID)
+    if mapID and RAID_ABBR[mapID] then return RAID_ABBR[mapID] end
     if not name then return nil end
     local tail = name:match("^.-:%s*(.+)$")
     return tail or name
@@ -411,6 +427,7 @@ function RDC.RefreshHUD()
     if not hud:IsShown() then return end
     local snap = RDC.GetSnapshot()
     local total = #snap
+    local deathSum = RDC.TotalDeaths(snap)
     -- The divisor stays the overall leader, not the top VISIBLE row, or bar widths would rescale as you
     -- scroll and stop being comparable between screenfuls.
     local top = (snap[1] and snap[1].deaths) or 1
@@ -464,8 +481,8 @@ function RDC.RefreshHUD()
         end
     end
 
-    local inst = ShortInstance(RDC.GetInstanceName())
-    title:SetText(inst and ("RDC: " .. inst) or "Raid Death Count")
+    local inst = ShortInstance(RDC.GetInstanceName(), RDC.GetMapID())
+    title:SetText(inst and (inst .. " (Total: " .. deathSum .. ")") or "Raid Death Count")
 
     UpdateSyncTag()
 end

@@ -181,10 +181,26 @@ function RDC.GetSnapshot()
     return out
 end
 
+-- Summed from a snapshot rather than kept as a running counter, so it can never drift from the rows the
+-- HUD and the report actually show. Pass a snapshot to avoid rebuilding one you already have.
+function RDC.TotalDeaths(snap)
+    local sum = 0
+    for _, e in ipairs(snap or RDC.GetSnapshot()) do sum = sum + e.deaths end
+    return sum
+end
+
 function RDC.GetInstanceName()
     if RDC.demoData then return "Demo Preview" end
     local s = ActiveSession()
     return s and s.instance
+end
+
+-- Same demo guard as GetInstanceName: without it the HUD would label demo rows with the real raid the
+-- session happens to be on.
+function RDC.GetMapID()
+    if RDC.demoData then return nil end
+    local s = ActiveSession()
+    return s and s.mapID
 end
 
 -- ── Demo / UI-preview mode ─────────────────────────────────────────────────────
@@ -539,6 +555,11 @@ function RDC.Report(mode)
     local limit = (mode == "top3" and 3) or (mode == "top5" and 5) or #snap
     local title = (mode == "top3" and "Top 3") or (mode == "top5" and "Top 5") or "All"
     ReportLine("Raid Death Count (" .. title .. "):")
+    -- Full report only: against a truncated top3/top5 list a raid-wide total reads as the sum of the rows
+    -- shown, which it is not.
+    if title == "All" then
+        ReportLine(("Total Deaths (%d)"):format(RDC.TotalDeaths(snap)))
+    end
     for i = 1, math.min(limit, #snap) do
         local e = snap[i]
         ReportLine(("%d. %s (%s): %d"):format(i, e.name, ClassLabel(e.class), e.deaths))
@@ -667,9 +688,6 @@ function RDC.DebugDump()
         local name, id, reset, diff, locked = GetSavedInstanceInfo(i)
         print(("  [%d] %s id=%s reset=%s diff=%s locked=%s"):format(i, tostring(name), tostring(id), tostring(reset), tostring(diff), tostring(locked)))
     end
-    for _, e in ipairs(RDC.GetSnapshot()) do
-        print(("  %s (%s): %d"):format(e.name, tostring(e.class), e.deaths))
-    end
     -- All sessions, so a stranded raidID's counts are visible and not just the active one's.
     print("|cff88bbffRDC|r sessions in DB:")
     for id, sess in pairs(DB and DB.sessions or {}) do
@@ -678,6 +696,15 @@ function RDC.DebugDump()
         print(("  <%s> instance=%s mapID=%s lock=%s players=%d totalDeaths=%d%s"):format(
             tostring(id), tostring(sess.instance), tostring(sess.mapID), tostring(sess.lockID), np, total,
             id == DB.currentRaidID and "  <== ACTIVE" or ""))
+    end
+    -- Last line so it stays on screen: chat scrolls the oldest print out of view first.
+    -- GetAddOnMemoryUsage reads a cached figure that only refreshes on demand, so without the update
+    -- call it reports whatever the last consumer of the API happened to leave behind.
+    local update = (C_AddOns and C_AddOns.UpdateAddOnMemoryUsage) or UpdateAddOnMemoryUsage
+    local usage  = (C_AddOns and C_AddOns.GetAddOnMemoryUsage) or GetAddOnMemoryUsage
+    if update and usage then
+        update()
+        print(("|cff88bbffRDC|r memory: %.1f KB"):format(usage(ADDON_NAME) or 0))
     end
 end
 
