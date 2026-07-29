@@ -125,6 +125,16 @@ local function InRaidInstance()
     return itype == "raid"
 end
 
+-- A battleground or arena replaces the group with a raid of strangers while our RaidID stays sticky from
+-- the last real raid, so there is nobody in there we have anything to say to. Worse, a BG group's addon
+-- traffic rides INSTANCE_CHAT, so a send to RAID never leaves the client: the heartbeat's echo cannot come
+-- back, the watchdog times out and reports a false outage on a loop for the whole match. Comms are
+-- suppressed outright rather than switched to INSTANCE_CHAT, because reaching that group is not wanted.
+local function InPvPInstance()
+    local _, itype = IsInInstance()
+    return itype == "pvp" or itype == "arena"
+end
+
 -- ── Sessions / data ───────────────────────────────────────────────────────────
 
 local function EnsureSession(rid, iname, mapID)
@@ -274,6 +284,7 @@ end
 -- Returns true only when a message actually went out. The watchdog needs that: arming an echo probe for a
 -- send that never happened (ungrouped) would time out and report a fake outage.
 local function SendComm(msg)
+    if InPvPInstance() then return false end   -- see InPvPInstance: unreachable group, and probing it lies
     local ch = GroupChannel()
     if not ch then return false end
     if C_ChatInfo and C_ChatInfo.SendAddonMessage then
@@ -443,6 +454,7 @@ local function CheckCommsProbe()
     if GetTime() - commsProbeSent < PROBE_TIMEOUT then return end
     commsProbeSent = nil
     if not IsInGroup() then return end       -- left the group mid-probe: no echo expected, not a fault
+    if InPvPInstance() then return end       -- ditto: we stopped sending on the way in, so silence is us
     MarkCommsDown()
     EnsurePrefix()   -- the only client-side repair available, and it counts itself (see EnsurePrefix)
 end
@@ -873,6 +885,10 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         -- it, so it would time out instantly on the far side and report an outage that never happened.
         -- AnnouncePresence below arms a fresh one.
         commsProbeSent = nil
+        -- Zoning into a BG or arena suspends comms outright (see InPvPInstance), so an outage still open
+        -- from the raid would hold the dot red for the whole match with no probe able to clear it. Drop
+        -- back to the unproven state; returning to the raid re-establishes the truth within PROBE_TIMEOUT.
+        if InPvPInstance() then commsOK, commsBrokenSince, reassertCount = nil, nil, 0 end
         RebuildWatched()
         UpdateRaidID()
         CheckActiveLockout()
@@ -962,7 +978,10 @@ function RDC.DebugDump()
     -- went deaf" from "nobody else here", which the sync count alone cannot do.
     local h = RDC.GetCommsHealth()
     local state
-    if h.ok == false then
+    -- First, because it explains every other figure on the line: nothing is sent or expected in here.
+    if InPvPInstance() then
+        state = "SUSPENDED (battleground/arena)"
+    elseif h.ok == false then
         state = ("DOWN since %s, %d re-asserts"):format(RDC.Ago(h.brokenSince), h.reasserts)
     elseif h.ok then
         state = "ok"
