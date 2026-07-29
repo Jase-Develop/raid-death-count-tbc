@@ -11,6 +11,12 @@ local SYNC_THROTTLE = 5                    -- min seconds between our resync rep
 local MSG_MAX       = 230                  -- soft cap on an addon-message body before we flush a chunk
 local PEER_STALE    = 90                   -- seconds before a silent peer drops out of the sync count
 local HEARTBEAT     = 30                   -- seconds between our presence pings (op H)
+local PROBE_TIMEOUT = 10                   -- seconds to wait for our own H to echo back before calling
+                                           -- comms broken. Generous on purpose: a false outage would
+                                           -- destroy trust in the indicator, and DebugDump reports the
+                                           -- worst echo time seen so this can be tuned against real data.
+local PROBE_RETRY   = 10                   -- seconds between probes while broken (HEARTBEAT when healthy),
+                                           -- so recovery is timestamped sharply enough to be evidence
 
 -- ── State ─────────────────────────────────────────────────────────────────────
 local DB                      -- = RaidDeathCountCharDB, PER CHARACTER (set at ADDON_LOADED): sessions +
@@ -19,11 +25,24 @@ local DB                      -- = RaidDeathCountCharDB, PER CHARACTER (set at A
 local prevDead   = {}         -- fullName -> last-seen dead state (nil = no baseline yet)
 local watched    = {}         -- array of unit tokens to sweep for deaths
 local lastSyncReply = 0       -- time() of our last full-state reply (throttle)
-local peers      = {}         -- sender -> { t = time() last heard, ver = their addon version }
+local peers      = {}         -- sender -> { t = time() last heard, ver = their addon version }. Entries are
+                              -- retained once stale, not deleted, so "lost contact" stays distinguishable
+                              -- from "never heard anyone"; cleared when we leave the group.
 local playerName              -- our own full name, to exclude ourselves from the peer count
 local lastHeartbeat = 0       -- time() of our last presence ping (op H)
 local lastSyncCount = 0       -- last live peer count we painted (repaint only when it changes)
 local wasInRaid  = false      -- were we inside the raid instance last sweep (re-baseline on re-entry)
+
+-- Comms watchdog. Durations use GetTime() (monotonic, sub-second); anything shown to a human uses time().
+local commsProbeSent          -- GetTime() of the H we are waiting to hear echo back (nil = not waiting)
+local commsOK                 -- nil = not yet established, true = echo seen, false = outage in progress
+local everLooped = false      -- has the echo EVER worked on this client (gates outage reporting)
+local commsBrokenSince        -- time() the current outage started
+local lastLoopback            -- time() our own message last echoed back
+local lastPeerRx              -- time() we last heard any OTHER client
+local reassertCount = 0       -- prefix re-asserts attempted during the current outage
+local maxEchoTime = 0         -- worst echo round trip seen, in seconds (calibrates PROBE_TIMEOUT)
+local lastOutage              -- { from, to, reasserts } for the most recent recovered outage
 
 local CheckActiveLockout      -- forward declaration: defined down in the lockout section, but the comms
                               -- above it have to be able to re-check before answering a resync
@@ -237,16 +256,25 @@ local function EnsurePrefix()
     if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
         C_ChatInfo.RegisterAddonMessagePrefix(COMM_PREFIX)
     end
+    -- Counted only while an outage is open, so the recovery report can say how many re-assertions it took.
+    -- That is evidence, not proof of cause: recovery on the first one points at a dropped registration,
+    -- recovery on the twentieth points at something server-side simply expiring on its own schedule.
+    if commsOK == false then reassertCount = reassertCount + 1 end
 end
 
+-- Returns true only when a message actually went out. The watchdog needs that: arming an echo probe for a
+-- send that never happened (ungrouped) would time out and report a fake outage.
 local function SendComm(msg)
     local ch = GroupChannel()
-    if not ch then return end
+    if not ch then return false end
     if C_ChatInfo and C_ChatInfo.SendAddonMessage then
         C_ChatInfo.SendAddonMessage(COMM_PREFIX, msg, ch)
     elseif SendAddonMessage then
         SendAddonMessage(COMM_PREFIX, msg, ch)
+    else
+        return false
     end
+    return true
 end
 
 function RDC.BroadcastDeath(name, class, deaths)
@@ -263,7 +291,11 @@ end
 -- Scoped to our RaidID like every other op, so the count only ever includes peers syncing the SAME raid.
 local function AnnouncePresence()
     if not DB.currentRaidID then return end
-    SendComm(DB.currentRaidID .. "|H|" .. RDC.GetVersion())
+    -- Doubles as the watchdog's echo probe. Only arm when nothing is already in flight, so the timeout is
+    -- measured from the OLDEST unanswered send rather than being pushed forward by every later one.
+    if SendComm(DB.currentRaidID .. "|H|" .. RDC.GetVersion()) and not commsProbeSent then
+        commsProbeSent = GetTime()
+    end
 end
 
 local function IsSelf(sender)
@@ -271,6 +303,74 @@ local function IsSelf(sender)
     if playerName and sender == playerName then return true end
     local short = sender:match("^[^-]+")                 -- our own broadcasts loop back to us; drop them
     return short ~= nil and short == UnitName("player")
+end
+
+-- ── Comms watchdog (echo probe) ───────────────────────────────────────────────
+-- Our own addon messages come back to us, which is the entire reason IsSelf exists. That makes every H
+-- ping a probe of the whole send-and-receive path requiring NO other addon user present, and it answers the
+-- one question the sync count cannot: a count of 1 reads identically whether we have gone deaf or we are
+-- simply the only user in the raid.
+--
+-- What the two signals together distinguish, which is the point of the exercise:
+--   echo back + peers heard    healthy
+--   echo back + peers silent   genuinely nobody else running it
+--   echo lost  + peers heard   our SEND is being dropped (server-side throttle or mute)
+--   echo lost  + peers silent  our RECEIVE is dead (the case EnsurePrefix was written for)
+-- Whether re-asserting the prefix is what ends an outage is recorded rather than assumed, since that is
+-- exactly the unverified claim behind the existing self-heal.
+--
+-- An outage is only ever declared after the echo has worked at least once, so a client where it does not
+-- work at all reports "never observed" instead of sitting in a permanent false alarm.
+
+local function MarkCommsUp()
+    if commsProbeSent then
+        local rtt = GetTime() - commsProbeSent
+        if rtt > maxEchoTime then maxEchoTime = rtt end
+    end
+    lastLoopback, everLooped, commsProbeSent = time(), true, nil
+    local recovered = (commsOK == false)
+    commsOK = true                       -- set BEFORE the repaint below, or the tag paints red one last
+                                         -- time and nothing ever repaints it green
+    if recovered then
+        local since = commsBrokenSince or time()
+        lastOutage = { from = since, to = time(), reasserts = reassertCount }
+        print(("|cff88bbffRaid Death Count|r comms recovered after %ds (%d prefix re-assert%s)."):format(
+            time() - since, reassertCount, reassertCount == 1 and "" or "s"))
+        commsBrokenSince, reassertCount = nil, 0
+        RefreshHUD()
+    end
+end
+
+local function MarkCommsDown()
+    if not everLooped then return end        -- never proved the echo works here, so this proves nothing
+    if commsOK == false then return end      -- already reported, do not repeat every retry
+    commsOK, commsBrokenSince, reassertCount = false, time(), 0
+    print("|cff88bbffRaid Death Count|r addon comms have gone silent, retrying in the background.")
+    RefreshHUD()
+end
+
+-- Any inbound message at all, before the RaidID filter: a message from the wrong raid still proves we can
+-- hear, and our own echo always carries our own id anyway.
+local function NoteInbound(sender)
+    if IsSelf(sender) then MarkCommsUp() else lastPeerRx = time() end
+end
+
+-- Called every tick. Cheap when idle: one comparison unless a probe is outstanding.
+local function CheckCommsProbe()
+    if not commsProbeSent then return end
+    if GetTime() - commsProbeSent < PROBE_TIMEOUT then return end
+    commsProbeSent = nil
+    if not IsInGroup() then return end       -- left the group mid-probe: no echo expected, not a fault
+    MarkCommsDown()
+    EnsurePrefix()   -- the only client-side repair available, and it counts itself (see EnsurePrefix)
+end
+
+function RDC.GetCommsHealth()
+    return {
+        ok = commsOK, everLooped = everLooped, brokenSince = commsBrokenSince,
+        lastLoopback = lastLoopback, lastPeerRx = lastPeerRx,
+        reasserts = reassertCount, maxEcho = maxEchoTime, lastOutage = lastOutage,
+    }
 end
 
 -- ── Update notice ─────────────────────────────────────────────────────────────
@@ -316,10 +416,13 @@ local function TouchPeer(sender, op, payload)
     if ver then CheckPeerVersion(ver) end
 end
 
+-- Stale peers are kept rather than deleted, because "we lost four people" and "nobody else is running the
+-- addon" are the same sync count of 1 and very different situations. Retention is bounded by the number of
+-- distinct addon users heard in one session, so raid-sized, and the table is local (a reload clears it).
 local function LivePeerCount()
     local now, n = time(), 0
-    for name, p in pairs(peers) do
-        if now - (p.t or 0) > PEER_STALE then peers[name] = nil else n = n + 1 end
+    for _, p in pairs(peers) do
+        if now - (p.t or 0) <= PEER_STALE then n = n + 1 end
     end
     return n
 end
@@ -335,6 +438,28 @@ function RDC.GetSyncPeers()
     end
     table.sort(out, function(a, b) return a.name < b.name end)
     return out
+end
+
+-- Peers heard from at some point but not within PEER_STALE. Returns (count, time() we last heard any of
+-- them), so the HUD can say "lost contact with 4, last heard 6m ago" instead of asserting that nobody else
+-- is running the addon, which is something we have no way to know.
+function RDC.GetLostPeers()
+    local now, n, recent = time(), 0, nil
+    for _, p in pairs(peers) do
+        if now - (p.t or 0) > PEER_STALE then
+            n = n + 1
+            if not recent or (p.t or 0) > recent then recent = p.t end
+        end
+    end
+    return n, recent
+end
+
+-- Shared by the HUD tooltip and DebugDump so both phrase elapsed time identically.
+function RDC.Ago(t)
+    if not t then return "never" end
+    local d = time() - t
+    if d < 60 then return d .. "s ago" end
+    return math.floor(d / 60) .. "m ago"
 end
 
 -- Throttled, and split into <=MSG_MAX chunks since an addon message caps around 255 bytes.
@@ -368,7 +493,9 @@ end
 -- Anything for a raid other than our current one is dropped.
 local function OnComm(msg, sender)
     local rid, op, payload = msg:match("^(.-)|(.-)|(.*)$")
-    if not rid or rid ~= DB.currentRaidID then return end
+    if not rid then return end
+    NoteInbound(sender)                      -- before the RaidID filter: hearing anything proves the path
+    if rid ~= DB.currentRaidID then return end
     TouchPeer(sender, op, payload)
     if op == "D" then
         local name, class, deaths = payload:match("^(.-),(.-),(%d+)$")
@@ -622,6 +749,10 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
 
     elseif event == "PLAYER_ENTERING_WORLD" then
         EnsurePrefix()        -- before the resync and presence below, or the replies are not heard
+        -- A probe armed before the loading screen can never be answered, and GetTime keeps running across
+        -- it, so it would time out instantly on the far side and report an outage that never happened.
+        -- AnnouncePresence below arms a fresh one.
+        commsProbeSent = nil
         RebuildWatched()
         UpdateRaidID()
         CheckActiveLockout()
@@ -632,6 +763,13 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     elseif event == "GROUP_ROSTER_UPDATE" then
         RebuildWatched()
         UpdateRaidID()
+        -- Left the group entirely: drop the peer history and the watchdog verdict, or the next group we
+        -- join opens reporting lost contact with people from the last one and possibly a stale outage.
+        -- everLooped and the worst echo time survive, being facts about this client rather than this group.
+        if not IsInGroup() then
+            wipe(peers)
+            commsOK, commsBrokenSince, commsProbeSent, reassertCount = nil, nil, nil, 0
+        end
         AnnouncePresence()
 
     elseif event == "UPDATE_INSTANCE_INFO" then
@@ -651,8 +789,11 @@ frame:SetScript("OnUpdate", function(_, elapsed)
         UpdateRaidID()   -- steady cadence picks up a zone change and runs CheckLockout even when
                          -- GROUP_ROSTER_UPDATE is quiet; cheap when nothing has changed
         Sweep()
+        CheckCommsProbe()
         local now = time()
-        if now - lastHeartbeat >= HEARTBEAT then
+        -- Probe harder while broken: the timestamp of recovery is the evidence for whether the prefix
+        -- re-assert is what fixes it, and at the 30s cadence that timestamp is too blurry to tell.
+        if now - lastHeartbeat >= ((commsOK == false) and PROBE_RETRY or HEARTBEAT) then
             lastHeartbeat = now
             EnsurePrefix()   -- re-assert: a silently dropped registration otherwise needs a /reload
             -- Safety net for a client parked in town across the weekly reset, which would otherwise keep
@@ -697,6 +838,30 @@ function RDC.DebugDump()
             tostring(id), tostring(sess.instance), tostring(sess.mapID), tostring(sess.lockID), np, total,
             id == DB.currentRaidID and "  <== ACTIVE" or ""))
     end
+    -- Comms health. The echo column is the one that matters: it is the only reading that separates "we
+    -- went deaf" from "nobody else here", which the sync count alone cannot do.
+    local h = RDC.GetCommsHealth()
+    local state
+    if h.ok == false then
+        state = ("DOWN since %s, %d re-asserts"):format(RDC.Ago(h.brokenSince), h.reasserts)
+    elseif h.ok then
+        state = "ok"
+    elseif not h.everLooped then
+        state = "echo NEVER observed"   -- either we have not probed yet or the echo does not work here
+    else
+        state = "idle (no probe answered since the last group)"
+    end
+    -- Parenthesised: GetLostPeers returns two values and this is the last argument, so without them the
+    -- second would spill into the format call.
+    print(("|cff88bbffRDC|r comms: %s   echo %s (worst %.1fs)   peers %s   live=%d lost=%d"):format(
+        state, RDC.Ago(h.lastLoopback), h.maxEcho, RDC.Ago(h.lastPeerRx),
+        LivePeerCount(), (RDC.GetLostPeers())))
+    if h.lastOutage then
+        print(("|cff88bbffRDC|r last outage: %ds, ended %s, %d prefix re-assert%s"):format(
+            (h.lastOutage.to or 0) - (h.lastOutage.from or 0), RDC.Ago(h.lastOutage.to),
+            h.lastOutage.reasserts or 0, (h.lastOutage.reasserts == 1) and "" or "s"))
+    end
+
     -- Last line so it stays on screen: chat scrolls the oldest print out of view first.
     -- GetAddOnMemoryUsage reads a cached figure that only refreshes on demand, so without the update
     -- call it reports whatever the last consumer of the API happened to leave behind.

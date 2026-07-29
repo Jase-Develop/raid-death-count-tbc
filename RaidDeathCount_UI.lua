@@ -184,13 +184,22 @@ local syncTx = syncTag:CreateFontString(nil, "OVERLAY")
 ApplyFont(syncTx, 10)
 syncTx:SetPoint("LEFT", syncDot, "RIGHT", 2, 0)
 
+-- Three states, not two. Grey alone could not tell a fault from a raid where nobody else runs the addon,
+-- which is exactly the ambiguity that made a reported desync impossible to date or confirm: red now means
+-- the comms watchdog has lost our own echo, grey means we are simply on our own.
 local function UpdateSyncTag()
     if not (RDC.GetSyncCount and IsInGroup()) then syncTag:Hide(); return end
     local n = RDC.GetSyncCount()
+    local h = RDC.GetCommsHealth and RDC.GetCommsHealth()
+    local down = h and h.ok == false
     syncTag:Show()
-    syncDot:SetTexture(n > 1 and "Interface\\COMMON\\Indicator-Green" or "Interface\\COMMON\\Indicator-Gray")
+    syncDot:SetTexture(down and "Interface\\COMMON\\Indicator-Red"
+        or (n > 1 and "Interface\\COMMON\\Indicator-Green")
+        or "Interface\\COMMON\\Indicator-Gray")
     syncTx:SetText(n)
-    if n > 1 then
+    if down then
+        syncTx:SetTextColor(0.95, 0.4, 0.4)
+    elseif n > 1 then
         syncTx:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
     else
         syncTx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
@@ -208,8 +217,25 @@ syncTag:SetScript("OnEnter", function(self)
     local peers = (RDC.GetSyncPeers and RDC.GetSyncPeers()) or {}
     GameTooltip:SetText("Addons in sync: " .. ((RDC.GetSyncCount and RDC.GetSyncCount()) or 1))
 
+    -- Comms first: an outage is the explanation for every other line under it, so it does not belong
+    -- buried below a peer list that the outage is the reason for.
+    local h = RDC.GetCommsHealth and RDC.GetCommsHealth()
+    if h and h.ok == false then
+        GameTooltip:AddLine(("Comms down since %s, retrying."):format(RDC.Ago(h.brokenSince)), 0.95, 0.4, 0.4, true)
+        GameTooltip:AddLine("Your own counts are still being kept.", 0.6, 0.6, 0.6, true)
+    end
+
     if #peers == 0 then
-        GameTooltip:AddLine("No one else is running the addon.", 0.6, 0.6, 0.6, true)
+        -- Never claim nobody is running it. We cannot know that, and saying it to someone who has just
+        -- silently lost four peers actively hides the fault.
+        local lost, lastHeard = 0, nil
+        if RDC.GetLostPeers then lost, lastHeard = RDC.GetLostPeers() end
+        if lost > 0 then
+            GameTooltip:AddLine(("Lost contact with %d peer%s, last heard %s."):format(
+                lost, lost == 1 and "" or "s", RDC.Ago(lastHeard)), 0.9, 0.7, 0.4, true)
+        else
+            GameTooltip:AddLine("No one else has been heard from.", 0.6, 0.6, 0.6, true)
+        end
         GameTooltip:Show()
         return
     end
