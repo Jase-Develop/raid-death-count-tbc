@@ -17,6 +17,8 @@ local PROBE_TIMEOUT = 10                   -- seconds to wait for our own H to e
                                            -- worst echo time seen so this can be tuned against real data.
 local PROBE_RETRY   = 10                   -- seconds between probes while broken (HEARTBEAT when healthy),
                                            -- so recovery is timestamped sharply enough to be evidence
+local DIGEST_COOLDOWN = 60                 -- min seconds between resyncs triggered by a digest mismatch, so
+                                           -- a raid that all disagrees at once cannot storm the channel
 
 -- ── State ─────────────────────────────────────────────────────────────────────
 local DB                      -- = RaidDeathCountCharDB, PER CHARACTER (set at ADDON_LOADED): sessions +
@@ -25,12 +27,16 @@ local DB                      -- = RaidDeathCountCharDB, PER CHARACTER (set at A
 local prevDead   = {}         -- fullName -> last-seen dead state (nil = no baseline yet)
 local watched    = {}         -- array of unit tokens to sweep for deaths
 local lastSyncReply = 0       -- time() of our last full-state reply (throttle)
-local peers      = {}         -- sender -> { t = time() last heard, ver = their addon version }. Entries are
-                              -- retained once stale, not deleted, so "lost contact" stays distinguishable
-                              -- from "never heard anyone"; cleared when we leave the group.
+local peers      = {}         -- sender -> { t = time() last heard, ver = their addon version, dig = their
+                              -- last state digest, mismatched = did that digest disagree with ours }.
+                              -- Entries are retained once stale, not deleted, so "lost contact" stays
+                              -- distinguishable from "never heard anyone"; cleared when we leave the group.
 local playerName              -- our own full name, to exclude ourselves from the peer count
 local lastHeartbeat = 0       -- time() of our last presence ping (op H)
 local lastSyncCount = 0       -- last live peer count we painted (repaint only when it changes)
+local lastResyncAsk = 0       -- time() of the last resync request we KNOW ABOUT, ours or a peer's. A peer's
+                              -- counts because "?" is a broadcast: their replies heal us too, so a second
+                              -- request adds traffic and nothing else (see DIGEST_COOLDOWN).
 local wasInRaid  = false      -- were we inside the raid instance last sweep (re-baseline on re-entry)
 
 -- Comms watchdog. Durations use GetTime() (monotonic, sub-second); anything shown to a human uses time().
@@ -147,6 +153,11 @@ end
 
 -- ── Death recording + merge ───────────────────────────────────────────────────
 
+-- Records locally and returns the new count. Broadcasting and repainting are deliberately the CALLER's
+-- job: Sweep finds every death of a raid wipe in one 0.5s tick, and a message each would be 20-25 sends
+-- from one client in a single frame, from every client at once. That is far over the server's
+-- addon-message rate limit, so the excess is dropped exactly when the counts matter most. The caller
+-- flushes the whole tick as one message instead.
 local function RecordDeath(name, class)
     local s = ActiveSession()
     if not s then return end
@@ -154,9 +165,7 @@ local function RecordDeath(name, class)
     if not p then p = { class = class, deaths = 0 }; s.players[name] = p end
     if class then p.class = class end
     p.deaths = p.deaths + 1
-    RefreshHUD()
-    RDC.BroadcastDeath(name, p.class, p.deaths)
-    return p.deaths
+    return p.deaths, p.class   -- the STORED class, which may be one we learned earlier when this read is nil
 end
 
 -- Merge by MAX. Counts only rise within a raid, so every client converges without dedup, ordering or
@@ -277,9 +286,46 @@ local function SendComm(msg)
     return true
 end
 
-function RDC.BroadcastDeath(name, class, deaths)
-    if not DB.currentRaidID then return end
-    SendComm(DB.currentRaidID .. "|D|" .. name .. "," .. (class or "") .. "," .. deaths)
+local function Entry(name, class, deaths)
+    return name .. "," .. (class or "") .. "," .. deaths .. ";"
+end
+
+-- Sends a list of "name,class,deaths;" entries as op S, split into <=MSG_MAX chunks since an addon message
+-- caps around 255 bytes. Shared by the full-state reply and the sweep batch, which put the same rows on the
+-- wire and must chunk them the same way.
+local function SendEntries(entries)
+    local prefix = DB.currentRaidID .. "|S|"
+    local buf, sent = "", false
+    for i = 1, #entries do
+        local e = entries[i]
+        -- The buf check matters for a single oversize entry: without it we would flush an empty payload
+        -- first and waste a message.
+        if buf ~= "" and #prefix + #buf + #e > MSG_MAX then
+            SendComm(prefix .. buf); buf = ""; sent = true
+        end
+        buf = buf .. e
+    end
+    if buf ~= "" then SendComm(prefix .. buf); sent = true end
+    return sent
+end
+
+-- One message for everything a single sweep found, instead of one per death.
+--
+-- Multiple deaths go out as S, NOT as a multi-entry D. Op D is specified as exactly one death and 0.5
+-- clients parse it with an anchored "^(.-),(.-),(%d+)$": handed two entries that pattern still MATCHES,
+-- and quietly records one player whose class is the middle of the string. Corrupting a peer mid-upgrade
+-- is far worse than the op being named slightly wrong. S already carries a multi-entry payload that every
+-- shipped version merges correctly, so a batch is wire-compatible with 0.5 in both directions.
+--
+-- A lone death still goes as D, so the overwhelmingly common case puts exactly the same bytes on the wire
+-- as it always has.
+function RDC.BroadcastDeaths(entries)
+    if not DB.currentRaidID or #entries == 0 then return end
+    if #entries == 1 then
+        SendComm(DB.currentRaidID .. "|D|" .. entries[1]:sub(1, -2))   -- strip the entry's trailing ";"
+    else
+        SendEntries(entries)
+    end
 end
 
 local function RequestResync()
@@ -287,13 +333,49 @@ local function RequestResync()
     SendComm(DB.currentRaidID .. "|?|")
 end
 
+-- ── State digest ──────────────────────────────────────────────────────────────
+-- A number every client computes from its own counts, ridden along on the heartbeat so two clients can
+-- notice they disagree without exchanging any state. Merge by MAX only heals a player when that player
+-- dies AGAIN, so without this a death lost to a dropped message stays lost for the rest of the night and
+-- each client converges on "the max I happened to hear" rather than on the truth.
+--
+-- A sum of deaths was the obvious digest and is not enough: the failure it has to catch is a wipe where I
+-- miss Bob's death and you miss Carl's, which leaves us on an identical total and permanently different
+-- rows. So the name is folded in per player, which makes the digest sensitive to WHICH deaths are missing
+-- and not just how many.
+--
+-- Two properties this must keep, or clients disagree over identical data and resync forever:
+--   * order independence, since pairs() order differs per client. Hence a sum, which commutes.
+--   * only rows a peer could also have. Zero-count rows are skipped (we may hold one for a player nobody
+--     has seen die) and class is excluded (it is legitimately "" until someone sees the unit).
+-- Reads the session directly rather than a snapshot, so demo mode can never reach the wire.
+local function StateDigest()
+    local s = ActiveSession()
+    if not s then return 0 end
+    local sum = 0
+    for name, p in pairs(s.players) do
+        local d = p.deaths or 0
+        if d > 0 then
+            local h = 0
+            for i = 1, #name do h = (h * 31 + name:byte(i)) % 65536 end
+            sum = (sum + h * d) % 1000000
+        end
+    end
+    return sum
+end
+
 -- ── Peer presence (the "in sync" count) ───────────────────────────────────────
 -- Scoped to our RaidID like every other op, so the count only ever includes peers syncing the SAME raid.
 local function AnnouncePresence()
     if not DB.currentRaidID then return end
+    -- Payload gained the digest after 0.5, which read the whole payload as a version string. A 0.5 client
+    -- hearing "0.6,12345" therefore parses the digits as version 0.6.12345 and prints "a new version is
+    -- available", which is CORRECT: only a client newer than 0.5 sends a digest at all. The one cost is
+    -- that its peer tooltip shows the raw field, cosmetic and only until it updates.
+    local body = RDC.GetVersion() .. "," .. StateDigest()
     -- Doubles as the watchdog's echo probe. Only arm when nothing is already in flight, so the timeout is
     -- measured from the OLDEST unanswered send rather than being pushed forward by every later one.
-    if SendComm(DB.currentRaidID .. "|H|" .. RDC.GetVersion()) and not commsProbeSent then
+    if SendComm(DB.currentRaidID .. "|H|" .. body) and not commsProbeSent then
         commsProbeSent = GetTime()
     end
 end
@@ -408,12 +490,47 @@ local function CheckPeerVersion(theirVer)
     print("|cff88bbffRaid Death Count|r there is a new version available.")
 end
 
--- Any op keeps a peer alive; only H carries a version, so retain the last one we saw.
+-- H payload is "<version>" from 0.5 and "<version>,<digest>" after it. The digest capture is optional and
+-- anchored, so an old payload yields the version and no digest rather than a half-parse.
+local function ParseHeartbeat(payload)
+    local ver, dig = tostring(payload or ""):match("^([^,]*),?(%d*)$")
+    if ver == "" then ver = nil end
+    return ver, tonumber(dig)
+end
+
+-- A settled disagreement, meaning the peer has repeated the SAME digest across two heartbeats and it
+-- differed from ours both times. Requiring it to repeat is what keeps a wipe quiet: during one, counts
+-- legitimately differ for a few seconds while the broadcasts land, and a digest that is still moving is
+-- not evidence of anything. Only a stuck disagreement is.
+--
+-- Both sides of a mismatch see it, so a raid that disagrees would all ask at once. Two things stop that
+-- storm, which matters because the whole reason a desync happened is that the channel was overloaded:
+-- the ask is a broadcast "?" whose replies heal everyone hearing it, so hearing a peer's request counts as
+-- ours (see lastResyncAsk), and DIGEST_COOLDOWN bounds the rest. One request per raid per minute.
+local function NoteDigest(p, dig)
+    if not dig then return end
+    local mine = StateDigest()
+    local settled = (p.dig == dig) and p.mismatched and (dig ~= mine)
+    p.dig, p.mismatched = dig, (dig ~= mine)
+    if settled and time() - lastResyncAsk >= DIGEST_COOLDOWN then
+        lastResyncAsk = time()
+        RequestResync()
+    end
+end
+
+-- Any op keeps a peer alive; only H carries a version and a digest, so retain the last ones we saw. The
+-- entry is updated in place rather than replaced: it now holds digest history that a wholesale rebuild on
+-- every inbound message would silently reset, which would stop a mismatch ever repeating.
 local function TouchPeer(sender, op, payload)
     if IsSelf(sender) then return end
-    local ver = (op == "H" and payload and payload ~= "" and payload) or (peers[sender] and peers[sender].ver)
-    peers[sender] = { t = time(), ver = ver }
-    if ver then CheckPeerVersion(ver) end
+    local p = peers[sender]
+    if not p then p = {}; peers[sender] = p end
+    p.t = time()
+    if op == "H" then
+        local ver, dig = ParseHeartbeat(payload)
+        if ver then p.ver = ver; CheckPeerVersion(ver) end
+        NoteDigest(p, dig)
+    end
 end
 
 -- Stale peers are kept rather than deleted, because "we lost four people" and "nobody else is running the
@@ -474,20 +591,11 @@ local function SendFullState()
     local s = ActiveSession()
     if not s then return end
     lastSyncReply = time()
-    local prefix = DB.currentRaidID .. "|S|"
-    local buf = ""
-    local flushed = false
+    local entries = {}
     for name, p in pairs(s.players) do
-        if (p.deaths or 0) > 0 then
-            local entry = name .. "," .. (p.class or "") .. "," .. p.deaths .. ";"
-            if #prefix + #buf + #entry > MSG_MAX then
-                SendComm(prefix .. buf); buf = ""; flushed = true
-            end
-            buf = buf .. entry
-        end
+        if (p.deaths or 0) > 0 then entries[#entries + 1] = Entry(name, p.class, p.deaths) end
     end
-    if buf ~= "" then SendComm(prefix .. buf); flushed = true end
-    return flushed
+    return SendEntries(entries)
 end
 
 -- Anything for a raid other than our current one is dropped.
@@ -507,6 +615,7 @@ local function OnComm(msg, sender)
         end
         if changed then RefreshHUD() end
     elseif op == "?" then
+        lastResyncAsk = time()   -- somebody has already asked; ours would only duplicate the replies
         SendFullState()
     elseif op == "H" then
         RefreshHUD()                                     -- a new or returning peer changes the sync count
@@ -518,6 +627,9 @@ end
 -- a death across the map is never missed. That is why this polls rather than driving off health events.
 -- Any remaining gap is filled by peers' broadcasts.
 
+local batch = {}   -- deaths found this tick, flushed as ONE message. Reused rather than reallocated: this
+                   -- runs twice a second for a whole raid night.
+
 local function Sweep()
     if not DB.currentRaidID then return end
     if not InRaidInstance() then wasInRaid = false; return end
@@ -526,6 +638,7 @@ local function Sweep()
         wipe(prevDead)   -- re-baseline on entry so already-dead state (including a world death we
                          -- corpse-walked in with) is recorded, not counted as a fresh death this tick
     end
+    wipe(batch)
     for _, unit in ipairs(watched) do
         local name = FullName(unit)
         if name then
@@ -535,11 +648,18 @@ local function Sweep()
                 prevDead[name] = dead            -- first sight: baseline only, we did not witness it
             elseif dead and not was then
                 prevDead[name] = true
-                RecordDeath(name, select(2, UnitClass(unit)))
+                local total, cls = RecordDeath(name, select(2, UnitClass(unit)))
+                if total then batch[#batch + 1] = Entry(name, cls, total) end
             elseif not dead then
                 prevDead[name] = false
             end
         end
+    end
+    -- One flush for the whole tick, so a 25-man wipe is one message rather than 25, and one repaint
+    -- rather than 25.
+    if #batch > 0 then
+        RefreshHUD()
+        RDC.BroadcastDeaths(batch)
     end
 end
 
@@ -856,6 +976,17 @@ function RDC.DebugDump()
     print(("|cff88bbffRDC|r comms: %s   echo %s (worst %.1fs)   peers %s   live=%d lost=%d"):format(
         state, RDC.Ago(h.lastLoopback), h.maxEcho, RDC.Ago(h.lastPeerRx),
         LivePeerCount(), (RDC.GetLostPeers())))
+    -- Our digest against every peer's. Same number everywhere means the raid genuinely agrees; a peer stuck
+    -- on a different one is the desync, visible here without waiting for the automatic resync to fire.
+    local mine, agree, differ = StateDigest(), {}, {}
+    for name, p in pairs(peers) do
+        local short = name:match("^[^-]+") or name
+        if p.dig == nil then differ[#differ + 1] = short .. "=?"
+        elseif p.dig == mine then agree[#agree + 1] = short
+        else differ[#differ + 1] = short .. "=" .. p.dig end
+    end
+    print(("|cff88bbffRDC|r digest: %d   agreeing=%d   differing: %s"):format(
+        mine, #agree, #differ > 0 and table.concat(differ, " ") or "none"))
     if h.lastOutage then
         print(("|cff88bbffRDC|r last outage: %ds, ended %s, %d prefix re-assert%s"):format(
             (h.lastOutage.to or 0) - (h.lastOutage.from or 0), RDC.Ago(h.lastOutage.to),
