@@ -1223,7 +1223,7 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
     else
         print("|cff88bbffRaidDeathCount|r v" .. RDC.GetVersion() .. " commands:")
         print("  /rdc                toggle the HUD")
-        print("  /rdc report [player|top3|top5|least|total|class|all]   report to party/raid")
+        print("  /rdc report [<name>|top3|top5|least|total|class|all]   report to party/raid")
         print("  /rdc lock           lock/unlock HUD move + resize")
         print("  /rdc minimap        show/hide the minimap button")
         print("  /rdc demo           toggle sample data for a UI preview")
