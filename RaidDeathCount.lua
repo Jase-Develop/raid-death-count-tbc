@@ -734,7 +734,8 @@ end
 -- Neither can misfire on a blank saved-instance read, hence no grace window: (1) reads only stored data,
 -- (2) needs a real id in hand.
 -- KNOWN GAP: a session that never saw a boss kill was never saved, carries no stamp, and so survives into
--- the following week. Needs a whole night with zero kills to hit; /rdc reset clears it.
+-- the following week. Needs a whole night with zero kills to hit, and since /rdc reset was removed there is
+-- no manual clear: it resolves itself once a boss kill stamps the session, or on entering a different raid.
 local function CheckLockout(s, iname)
     if not s then return end
     local id, resetIn = FindLockout(iname or s.instance)
@@ -963,17 +964,6 @@ function RDC.Report(mode)
         local e = snap[i]
         ReportLine(("%d. %s (%s): %d"):format(i, e.name, ClassLabel(e.class), e.deaths))
     end
-end
-
--- Local only. In a group a peer's next D or S heals the counts back by MAX, so this is a solo convenience,
--- not a group reset. See CLAUDE.md for why there is no group reset.
-function RDC.ResetCurrent()
-    if not DB or not DB.currentRaidID then return end
-    local s = DB.sessions[DB.currentRaidID]
-    if s then wipe(s.players); s.combatSeconds = 0 end
-    wipe(prevDead)
-    RefreshHUD()
-    print("|cff88bbffRaidDeathCount|r current raid counts cleared.")
 end
 
 -- ── Events / driver ───────────────────────────────────────────────────────────
@@ -1220,8 +1210,6 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
 
     if cmd == "report" then
         RDC.Report(rest ~= "" and rest or "all")
-    elseif cmd == "reset" then
-        RDC.ResetCurrent()
     elseif cmd == "lock" then
         if RDC.ToggleLock then RDC.ToggleLock() end
     elseif cmd == "minimap" then
@@ -1240,6 +1228,5 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
         print("  /rdc minimap        show/hide the minimap button")
         print("  /rdc demo           toggle sample data for a UI preview")
         print("  /rdc version        print the addon version")
-        print("  /rdc reset          clear this raid's counts")
     end
 end

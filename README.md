@@ -44,7 +44,6 @@ deaths. No dependencies, no setup, no configuration to get wrong.
 | `/rdc lock` | Lock or unlock moving and resizing. |
 | `/rdc minimap` | Show or hide the minimap button. |
 | `/rdc demo` | Fill the HUD with sample data for a look around. Never touches real counts. |
-| `/rdc reset` | Clear the current raid's counts for you only. In a group your raidmates will fill them straight back in, so this is really for testing on your own. |
 | `/rdc version` | Print the version. |
 
 Anything else prints the list above.
