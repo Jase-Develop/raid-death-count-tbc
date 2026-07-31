@@ -163,7 +163,7 @@ local function MakeFlatButton(parent, w, h, label, fontSize, tooltip)
     end)
     b:SetScript("OnLeave", function()
         tx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
-        GameTooltip:Hide()
+        if tooltip then GameTooltip:Hide() end   -- only ours to hide; a tooltipless button leaves it alone
     end)
     return b
 end
@@ -273,13 +273,14 @@ syncTag:SetScript("OnLeave", function() GameTooltip:Hide() end)
 -- keeps no saved position, so unlike the HUD there is no way for it to end up stranded off screen.
 local PANEL_BTN_W, PANEL_BTN_H, PANEL_GAP, PANEL_COLS = 56, 18, 3, 3
 
+-- No tooltips: the labels say what they do, unlike the header's lone R.
 local REPORTS = {
-    { "All",      "all",   "Every player, plus the raid total" },
-    { "Top 3",    "top3",  "The three highest death counts" },
-    { "Top 5",    "top5",  "The five highest death counts" },
-    { "Total",    "total", "Raid total on one line" },
-    { "Fewest",   "least", "Lowest count, with the deathless at zero" },
-    { "By Class", "class", "Deaths summed per class" },
+    { "All",      "all"   },
+    { "Top 3",    "top3"  },
+    { "Top 5",    "top5"  },
+    { "Total",    "total" },
+    { "Fewest",   "least" },
+    { "By Class", "class" },
 }
 
 local panelRows = math.ceil(#REPORTS / PANEL_COLS)
@@ -303,28 +304,27 @@ panelTitle:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
 panelTitle:SetText("Reports")
 
 for i, r in ipairs(REPORTS) do
-    local label, mode, tip = r[1], r[2], r[3]
+    local label, mode = r[1], r[2]
     local col, row = (i - 1) % PANEL_COLS, math.floor((i - 1) / PANEL_COLS)
-    local b = MakeFlatButton(panel, PANEL_BTN_W, PANEL_BTN_H, label, 10, tip)
+    local b = MakeFlatButton(panel, PANEL_BTN_W, PANEL_BTN_H, label, 10)
     b:SetPoint("TOPLEFT", panelHeader, "BOTTOMLEFT",
                col * (PANEL_BTN_W + PANEL_GAP), -PANEL_GAP - row * (PANEL_BTN_H + PANEL_GAP))
     b:SetScript("OnClick", function()
-        GameTooltip:Hide()      -- the panel goes away under the cursor, so OnLeave never fires
         panel:Hide()
         RDC.Report(mode)
     end)
 end
 
--- Prefers to hang below the HUD and flips above when there is not room, so a HUD parked at the bottom of
--- the screen does not open the panel off it. Recomputed on every open rather than cached, since the HUD
--- moves and resizes freely between one open and the next.
+-- Sits above the HUD, dropping below only when there is no room above, so a HUD parked at the top of the
+-- screen does not open the panel off it. Recomputed on every open rather than cached, since the HUD moves
+-- and resizes freely between one open and the next.
 local function PositionPanel()
     panel:ClearAllPoints()
-    local bottom = hud:GetBottom()
-    if bottom and bottom - panel:GetHeight() - 2 < 0 then
-        panel:SetPoint("BOTTOMRIGHT", hud, "TOPRIGHT", 0, 2)
-    else
+    local top, screenH = hud:GetTop(), UIParent:GetHeight()
+    if top and screenH and top + panel:GetHeight() + 2 > screenH then
         panel:SetPoint("TOPRIGHT", hud, "BOTTOMRIGHT", 0, -2)
+    else
+        panel:SetPoint("BOTTOMRIGHT", hud, "TOPRIGHT", 0, 2)
     end
 end
 
