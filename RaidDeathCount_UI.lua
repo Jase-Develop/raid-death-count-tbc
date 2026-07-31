@@ -466,10 +466,31 @@ scrollThumb:SetScript("OnLeave", function() if not dragGrab then ThumbColor(THEM
 -- ── Rows ──────────────────────────────────────────────────────────────────────
 local ROW_POOL = 40
 local rows = {}
+local BAR_ALPHA, BAR_ALPHA_HOVER = 0.55, 0.85
+
+local function RowBarAlpha(row) return row:IsMouseOver() and BAR_ALPHA_HOVER or BAR_ALPHA end
 
 local function MakeRow(i)
     local row = CreateFrame("Frame", nil, body)
     row:SetHeight(ROW_H - 1)
+
+    -- Ctrl-click reports the row's player. Ctrl rather than a plain click because a bare left click on a
+    -- dense list posts to raid chat on a misclick, and mouse-up rather than down so it can be aborted by
+    -- dragging off. Enabling mouse does NOT enable the wheel, so the scroll handler on hud still gets it.
+    row:EnableMouse(true)
+    row:SetScript("OnMouseUp", function(self, button)
+        -- Read at click time, never captured: rows are recycled by slot, so a row that held Bob before
+        -- you scrolled holds someone else now.
+        if button == "LeftButton" and IsControlKeyDown() and self.entry then
+            RDC.ReportPlayer(self.entry)
+        end
+    end)
+    row:SetScript("OnEnter", function(self)
+        self.bar:SetVertexColor(self.cr or 0.4, self.cg or 0.4, self.cb or 0.4, BAR_ALPHA_HOVER)
+    end)
+    row:SetScript("OnLeave", function(self)
+        self.bar:SetVertexColor(self.cr or 0.4, self.cg or 0.4, self.cb or 0.4, BAR_ALPHA)
+    end)
 
     row.bar = row:CreateTexture(nil, "BACKGROUND")
     row.bar:SetTexture("Interface\\Buttons\\WHITE8X8")
@@ -563,10 +584,16 @@ function RDC.RefreshHUD()
             local r, g, b = 0.4, 0.4, 0.4
             if c then r, g, b = c.r, c.g, c.b end
 
+            -- What ctrl-click reports, refreshed every pass because the pool recycles slots as you scroll.
+            row.entry = e
+            row.cr, row.cg, row.cb = r, g, b
+
             -- Proportional to the leader's count, floored at a sliver so a 1-death bar is still visible.
             local frac = math.max(0.12, e.deaths / top)
             row.bar:SetWidth(rowW * frac)
-            row.bar:SetVertexColor(r, g, b, 0.55)
+            -- Honours the hover state: a refresh mid-hover (a death lands, the frame resizes) must not
+            -- flick the highlighted row back to its resting colour under the cursor.
+            row.bar:SetVertexColor(r, g, b, RowBarAlpha(row))
 
             if e.class and CLASS_ICON_TCOORDS and CLASS_ICON_TCOORDS[e.class] then
                 row.icon:SetTexture(CLASS_TEX)

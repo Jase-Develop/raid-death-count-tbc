@@ -17,7 +17,8 @@ deaths. No dependencies, no setup, no configuration to get wrong.
 
 ## The HUD
 
-- Rows sorted by deaths, with a class-coloured bar behind each one.
+- Rows sorted by deaths, with a class-coloured bar behind each one. **Ctrl+click a row** to report just
+  that player to chat. The bar brightens under the cursor to show a row is clickable.
 - Header buttons, right to left: close, lock, **R** to open the reports panel, and a sync indicator
   showing how many raiders are running the addon. Hover it for details.
 - The **R** panel holds every report in one place: all, top 3, top 5, the raid total, fewest deaths, and

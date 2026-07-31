@@ -794,6 +794,17 @@ local function ReportLine(text)
     end
 end
 
+-- Reports one player straight from a snapshot row. The HUD calls this for a ctrl-clicked row rather than
+-- routing the name back through RDC.Report: that path is a prefix search that interpolates the name into a
+-- Lua pattern, so a cross-realm "Bob-Frostmourne" would be read as a quantifier and match nothing, failing
+-- on exactly the name it was handed. Searching for a row we are already holding is also pointless work.
+-- Prints the short name to match what the HUD row shows and what was clicked.
+function RDC.ReportPlayer(e)
+    if not e or not e.name then return end
+    local short = e.name:match("^[^-]+") or e.name
+    ReportLine(("%s (%s): %d death%s"):format(short, ClassLabel(e.class), e.deaths, e.deaths == 1 and "" or "s"))
+end
+
 -- Anything NOT in here is treated as a player-name prefix, so a new keyword must be added or
 -- "/rdc report <keyword>" silently searches for a player of that name instead.
 local REPORT_MODES = {
