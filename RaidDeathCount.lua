@@ -794,15 +794,112 @@ local function ReportLine(text)
     end
 end
 
--- mode = "all" | "top3" | "top5" | a player-name prefix.
+-- Anything NOT in here is treated as a player-name prefix, so a new keyword must be added or
+-- "/rdc report <keyword>" silently searches for a player of that name instead.
+local REPORT_MODES = {
+    all = true, top3 = true, top5 = true, total = true,
+    least = true, lowest = true, class = true, classes = true,
+}
+
+-- Candidates for "fewest deaths". A snapshot cannot answer this on its own: GetSnapshot drops zero-count
+-- rows, so the players who actually went deathless, the ones the question is really about, have no row in
+-- it at all. The live roster has them, and a roster unit also carries a class we can trust, unlike a
+-- session row for someone we have only ever heard about over comms. Returns nil when there is no roster
+-- worth reading, meaning demo mode, where the sample rows are the whole point, or ungrouped, where the
+-- roster is just us; the caller falls back to the snapshot rows in that case.
+local function FewestCandidates(snap)
+    if RDC.demoData or not IsInGroup() then return nil end
+
+    local deaths = {}
+    for _, e in ipairs(snap) do deaths[e.name] = e.deaths end
+
+    local out = {}
+    for _, unit in ipairs(watched) do
+        local name = FullName(unit)     -- same key the counts are stored under, so the lookup lines up
+        if name then
+            out[#out + 1] = { name = name, class = select(2, UnitClass(unit)), deaths = deaths[name] or 0 }
+        end
+    end
+    table.sort(out, function(a, b) return a.name < b.name end)
+    return out
+end
+
+-- mode = "all" | "top3" | "top5" | "total" | "least" (alias "lowest") | "class" (alias "classes")
+--        | a player-name prefix.
 function RDC.Report(mode)
     local snap = RDC.GetSnapshot()
     if #snap == 0 then ReportLine("No deaths recorded yet.") return end
 
-    if mode and mode ~= "all" and mode ~= "top3" and mode ~= "top5" then
-        local want = mode:lower()
+    -- Keywords match case insensitively; mode itself stays as typed so a miss can echo the name back.
+    local key = mode and mode:lower() or "all"
+
+    if key == "total" then
+        local total = RDC.TotalDeaths(snap)
+        ReportLine(("Raid Death Count: %d total death%s"):format(total, total == 1 and "" or "s"))
+        return
+    end
+
+    -- Deaths summed per class instead of per player. Snapshot-based, unlike "least" below: a class with
+    -- nobody dead has nothing to say, whereas a player with no deaths is the whole point of that command.
+    if key == "class" or key == "classes" then
+        local byClass, order = {}, {}
         for _, e in ipairs(snap) do
-            if e.name:lower():match("^" .. want) then
+            -- A row can legitimately carry no class (a player we have only ever heard about over comms and
+            -- never seen), and ClassLabel maps "" to "", which would print a bucket with no name at all.
+            local label = (e.class and e.class ~= "") and ClassLabel(e.class) or "Unknown"
+            if not byClass[label] then
+                byClass[label] = 0
+                order[#order + 1] = label
+            end
+            byClass[label] = byClass[label] + e.deaths
+        end
+        table.sort(order, function(a, b)
+            if byClass[a] ~= byClass[b] then return byClass[a] > byClass[b] end
+            return a < b
+        end)
+
+        ReportLine("Raid Death Count (by class):")
+        -- Safe to total here, unlike top3/top5: every death lands in some bucket, so the figure really is
+        -- the sum of the rows shown.
+        ReportLine(("Total Deaths (%d)"):format(RDC.TotalDeaths(snap)))
+        for i, label in ipairs(order) do
+            ReportLine(("%d. %s: %d"):format(i, label, byClass[label]))
+        end
+        return
+    end
+
+    -- Fewest deaths across the raid, counting the deathless at zero. A lone winner reads better on one
+    -- line, but a tie is listed row by row in the same shape as the top3/top5/all reports: against a
+    -- roster a tie is routinely most of the raid, which no single line could hold anyway.
+    if key == "least" or key == "lowest" then
+        local rows, fewest = FewestCandidates(snap)
+        if rows and #rows > 0 then
+            fewest = rows[1].deaths
+            for _, e in ipairs(rows) do if e.deaths < fewest then fewest = e.deaths end end
+        else
+            rows, fewest = snap, snap[#snap].deaths   -- sorted deaths desc, so the tail is the minimum
+        end
+
+        local tied = {}
+        for _, e in ipairs(rows) do
+            if e.deaths == fewest then tied[#tied + 1] = e end
+        end
+
+        local header = ("Raid Death Count (fewest, %d death%s)"):format(fewest, fewest == 1 and "" or "s")
+        if #tied == 1 then
+            ReportLine(("%s: %s (%s)"):format(header, tied[1].name, ClassLabel(tied[1].class)))
+        else
+            ReportLine(header .. ":")
+            for i, e in ipairs(tied) do
+                ReportLine(("%d. %s (%s): %d"):format(i, e.name, ClassLabel(e.class), e.deaths))
+            end
+        end
+        return
+    end
+
+    if not REPORT_MODES[key] then
+        for _, e in ipairs(snap) do
+            if e.name:lower():match("^" .. key) then
                 ReportLine(("%s (%s): %d death%s"):format(e.name, ClassLabel(e.class), e.deaths, e.deaths == 1 and "" or "s"))
                 return
             end
@@ -811,8 +908,8 @@ function RDC.Report(mode)
         return
     end
 
-    local limit = (mode == "top3" and 3) or (mode == "top5" and 5) or #snap
-    local title = (mode == "top3" and "Top 3") or (mode == "top5" and "Top 5") or "All"
+    local limit = (key == "top3" and 3) or (key == "top5" and 5) or #snap
+    local title = (key == "top3" and "Top 3") or (key == "top5" and "Top 5") or "All"
     ReportLine("Raid Death Count (" .. title .. "):")
     -- Full report only: against a truncated top3/top5 list a raid-wide total reads as the sum of the rows
     -- shown, which it is not.
@@ -1061,7 +1158,7 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
     else
         print("|cff88bbffRaidDeathCount|r v" .. RDC.GetVersion() .. " commands:")
         print("  /rdc                toggle the HUD")
-        print("  /rdc report [player|top3|top5|all]   report to party/raid")
+        print("  /rdc report [player|top3|top5|least|total|class|all]   report to party/raid")
         print("  /rdc lock           lock/unlock HUD move + resize")
         print("  /rdc minimap        show/hide the minimap button")
         print("  /rdc demo           toggle sample data for a UI preview")

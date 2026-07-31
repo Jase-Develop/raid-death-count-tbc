@@ -18,8 +18,10 @@ deaths. No dependencies, no setup, no configuration to get wrong.
 ## The HUD
 
 - Rows sorted by deaths, with a class-coloured bar behind each one.
-- Header buttons, right to left: close, lock, **A** / **3** / **5** to report all or the top 3 or 5 to
-  chat, and a sync indicator showing how many raiders are running the addon. Hover it for details.
+- Header buttons, right to left: close, lock, **R** to open the reports panel, and a sync indicator
+  showing how many raiders are running the addon. Hover it for details.
+- The **R** panel holds every report in one place: all, top 3, top 5, the raid total, fewest deaths, and
+  a per-class breakdown. Pick one and it posts to chat and closes.
 - Scrolls with the mouse wheel when more players die than fit, so you can keep the frame small.
 - Unlock it to drag by the title bar and resize from the bottom-right corner. Clicking a row will not
   move it.
@@ -36,7 +38,7 @@ deaths. No dependencies, no setup, no configuration to get wrong.
 | Command | Does |
 | --- | --- |
 | `/rdc` | Show or hide the HUD. |
-| `/rdc report` | Post counts to raid chat. Add `top3`, `top5`, or `player <name>` to narrow it. |
+| `/rdc report` | Post counts to raid chat. Add `top3`, `top5`, `least`, `total`, `class`, or `player <name>` to narrow it. |
 | `/rdc lock` | Lock or unlock moving and resizing. |
 | `/rdc minimap` | Show or hide the minimap button. |
 | `/rdc demo` | Fill the HUD with sample data for a look around. Never touches real counts. |

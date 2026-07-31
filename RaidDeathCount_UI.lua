@@ -142,40 +142,42 @@ lockBtn:SetScript("OnEnter", function(self)
 end)
 lockBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
--- Each button anchors to the LEFT of the previous one, so they are created right to left and read
--- A, 3, 5 on screen.
-local function MakeReportButton(label, anchorTo, tooltip, mode)
-    local b = CreateFrame("Button", nil, header, "BackdropTemplate")
-    b:SetSize(HEADER_H - 4, HEADER_H - 4)
-    b:SetPoint("RIGHT", anchorTo, "LEFT", -2, 0)
+-- A flat text button in the addon's own style: dim label, accent on hover, tooltip optional. Shared by the
+-- header's report toggle and every button in the report panel so the two cannot drift apart visually.
+local function MakeFlatButton(parent, w, h, label, fontSize, tooltip)
+    local b = CreateFrame("Button", nil, parent, "BackdropTemplate")
+    b:SetSize(w, h)
     ApplyFlat(b, THEME.bg, true)
     local tx = b:CreateFontString(nil, "OVERLAY")
-    ApplyFont(tx, 10)
+    ApplyFont(tx, fontSize)
     tx:SetPoint("CENTER")
     tx:SetText(label)
     tx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
     b:SetScript("OnEnter", function(self)
         tx:SetTextColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
-        GameTooltip:SetOwner(self, "ANCHOR_TOP")
-        GameTooltip:SetText(tooltip)
-        GameTooltip:Show()
+        if tooltip then
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            GameTooltip:SetText(tooltip)
+            GameTooltip:Show()
+        end
     end)
     b:SetScript("OnLeave", function()
         tx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
         GameTooltip:Hide()
     end)
-    b:SetScript("OnClick", function() RDC.Report(mode) end)
     return b
 end
 
-local report5Btn   = MakeReportButton("5", lockBtn,    "Report top 5",      "top5")
-local report3Btn   = MakeReportButton("3", report5Btn,  "Report top 3",      "top3")
-local reportAllBtn = MakeReportButton("A", report3Btn,  "Report all deaths", "all")
+-- One toggle where the A/3/5 buttons used to sit. The header is width constrained: at MIN_W the fixed
+-- furniture already leaves the title barely any room, so report modes past the original three earn their
+-- place in the panel below rather than costing another 16px up here.
+local reportBtn = MakeFlatButton(header, HEADER_H - 4, HEADER_H - 4, "R", 10, "Reports")
+reportBtn:SetPoint("RIGHT", lockBtn, "LEFT", -2, 0)
 
 -- Dot + count of addons in sync (us + live peers). Hidden when ungrouped, where the number is always 1.
 local syncTag = CreateFrame("Frame", nil, header)
 syncTag:SetSize(26, HEADER_H - 4)
-syncTag:SetPoint("RIGHT", reportAllBtn, "LEFT", -5, 0)
+syncTag:SetPoint("RIGHT", reportBtn, "LEFT", -5, 0)
 syncTag:EnableMouse(true)
 local syncDot = syncTag:CreateTexture(nil, "OVERLAY")
 syncDot:SetSize(9, 9)
@@ -264,6 +266,84 @@ syncTag:SetScript("OnEnter", function(self)
     GameTooltip:Show()
 end)
 syncTag:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+-- ── Report panel ──────────────────────────────────────────────────────────────
+-- Every reporting action in one place, so the header does not have to grow a button per mode. A child of
+-- the HUD, which buys travelling with it and hiding with it for nothing, and deliberately transient: it
+-- keeps no saved position, so unlike the HUD there is no way for it to end up stranded off screen.
+local PANEL_BTN_W, PANEL_BTN_H, PANEL_GAP, PANEL_COLS = 56, 18, 3, 3
+
+local REPORTS = {
+    { "All",      "all",   "Every player, plus the raid total" },
+    { "Top 3",    "top3",  "The three highest death counts" },
+    { "Top 5",    "top5",  "The five highest death counts" },
+    { "Total",    "total", "Raid total on one line" },
+    { "Fewest",   "least", "Lowest count, with the deathless at zero" },
+    { "By Class", "class", "Deaths summed per class" },
+}
+
+local panelRows = math.ceil(#REPORTS / PANEL_COLS)
+local panel = CreateFrame("Frame", "RaidDeathCount_ReportPanel", hud, "BackdropTemplate")
+panel:SetSize(PAD * 2 + PANEL_COLS * PANEL_BTN_W + (PANEL_COLS - 1) * PANEL_GAP,
+              PAD * 2 + HEADER_H + PANEL_GAP + panelRows * PANEL_BTN_H + (panelRows - 1) * PANEL_GAP)
+panel:SetFrameStrata("DIALOG")   -- opens outside the HUD bounds, so it must not sit under other windows
+ApplyFlat(panel, THEME.bg, true)
+panel:Hide()
+
+local panelHeader = CreateFrame("Frame", nil, panel, "BackdropTemplate")
+panelHeader:SetHeight(HEADER_H)
+panelHeader:SetPoint("TOPLEFT", panel, "TOPLEFT", PAD, -PAD)
+panelHeader:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -PAD, -PAD)
+ApplyFlat(panelHeader, THEME.panel, true)
+
+local panelTitle = panelHeader:CreateFontString(nil, "OVERLAY")
+ApplyFont(panelTitle, 11)
+panelTitle:SetPoint("LEFT", panelHeader, "LEFT", 5, 0)
+panelTitle:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+panelTitle:SetText("Reports")
+
+for i, r in ipairs(REPORTS) do
+    local label, mode, tip = r[1], r[2], r[3]
+    local col, row = (i - 1) % PANEL_COLS, math.floor((i - 1) / PANEL_COLS)
+    local b = MakeFlatButton(panel, PANEL_BTN_W, PANEL_BTN_H, label, 10, tip)
+    b:SetPoint("TOPLEFT", panelHeader, "BOTTOMLEFT",
+               col * (PANEL_BTN_W + PANEL_GAP), -PANEL_GAP - row * (PANEL_BTN_H + PANEL_GAP))
+    b:SetScript("OnClick", function()
+        GameTooltip:Hide()      -- the panel goes away under the cursor, so OnLeave never fires
+        panel:Hide()
+        RDC.Report(mode)
+    end)
+end
+
+-- Prefers to hang below the HUD and flips above when there is not room, so a HUD parked at the bottom of
+-- the screen does not open the panel off it. Recomputed on every open rather than cached, since the HUD
+-- moves and resizes freely between one open and the next.
+local function PositionPanel()
+    panel:ClearAllPoints()
+    local bottom = hud:GetBottom()
+    if bottom and bottom - panel:GetHeight() - 2 < 0 then
+        panel:SetPoint("BOTTOMRIGHT", hud, "TOPRIGHT", 0, 2)
+    else
+        panel:SetPoint("TOPRIGHT", hud, "BOTTOMRIGHT", 0, -2)
+    end
+end
+
+reportBtn:SetScript("OnClick", function()
+    if panel:IsShown() then panel:Hide() return end
+    PositionPanel()
+    panel:Show()
+end)
+
+-- Dragging the HUD would carry the panel along on an anchor chosen for where the HUD used to be, which is
+-- how it would end up off screen despite PositionPanel. Cheaper to close it than to track the drag.
+header:HookScript("OnDragStart", function() panel:Hide() end)
+
+-- Hiding the HUD hides the panel with it as a child, but a child keeps its own shown flag, so without this
+-- closing the HUD mid-panel and reopening it would bring the panel back uninvited.
+hud:HookScript("OnHide", function() panel:Hide() end)
+
+-- Escape closes it like any other transient window. This is why the frame is globally named.
+if UISpecialFrames then table.insert(UISpecialFrames, "RaidDeathCount_ReportPanel") end
 
 -- ── Resize grip (bottom-right) ────────────────────────────────────────────────
 local grip = CreateFrame("Button", nil, hud)
