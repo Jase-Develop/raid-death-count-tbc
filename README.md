@@ -39,10 +39,25 @@ deaths. No dependencies, no setup, no configuration to get wrong.
 | Command | Does |
 | --- | --- |
 | `/rdc` | Show or hide the HUD. |
-| `/rdc report` | Post counts to raid chat. Add `top3`, `top5`, `least`, `total`, `class`, or `player <name>` to narrow it. |
+| `/rdc report` | Post counts to raid chat. Add `top3`, `top5`, `least`, `total` or `class` to narrow it. |
+| `/rdc report <name>` | Post one player's count. Ctrl+clicking their row in the HUD does the same thing. |
 | `/rdc lock` | Lock or unlock moving and resizing. |
 | `/rdc minimap` | Show or hide the minimap button. |
 | `/rdc demo` | Fill the HUD with sample data for a look around. Never touches real counts. |
+| `/rdc reset` | Clear the current raid's counts for you only. In a group your raidmates will fill them straight back in, so this is really for testing on your own. |
 | `/rdc version` | Print the version. |
 
 Anything else prints the list above.
+
+## Something not right?
+
+If the numbers look off, these print a diagnostic into your chat window. They only read information, so
+none of them can change or clear your counts.
+
+| Type this | Use it when |
+| --- | --- |
+| `/run RaidDeathCount.DebugComms()` | Your counts disagree with a raidmate's, or the sync dot has gone red. |
+| `/run RaidDeathCount.DebugRaid()` | Counts did not start fresh for a new week, or the HUD names the wrong raid. |
+| `/run RaidDeathCount.DebugTimer()` | Checking how long the raid has spent in combat. |
+| `/run RaidDeathCount.DebugMemory()` | Checking how much memory the addon is using. |
+| `/run RaidDeathCount.DebugDump()` | All of the above at once. Paste this if you are reporting a problem. |

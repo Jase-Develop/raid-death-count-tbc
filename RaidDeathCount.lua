@@ -39,6 +39,13 @@ local lastResyncAsk = 0       -- time() of the last resync request we KNOW ABOUT
                               -- request adds traffic and nothing else (see DIGEST_COOLDOWN).
 local wasInRaid  = false      -- were we inside the raid instance last sweep (re-baseline on re-entry)
 
+-- Combat timer. Measures seconds the RAID spent fighting, not wall clock, which is what makes it survive a
+-- multi-night lockout with no gap rule: the hours between Tuesday and Thursday simply are not counted.
+-- Purely local, deliberately: nothing about it crosses the wire, so there is no clock to agree on and no
+-- message cost. GetTime() (monotonic, sub-second) for the same reason the watchdog uses it.
+local inCombat        = false -- was the raid in combat as of the last sweep
+local lastCombatTick          -- GetTime() at the last accumulation (nil = nothing banked yet)
+
 -- Comms watchdog. Durations use GetTime() (monotonic, sub-second); anything shown to a human uses time().
 local commsProbeSent          -- GetTime() of the H we are waiting to hear echo back (nil = not waiting)
 local commsOK                 -- nil = not yet established, true = echo seen, false = outage in progress
@@ -138,7 +145,8 @@ end
 -- ── Sessions / data ───────────────────────────────────────────────────────────
 
 local function EnsureSession(rid, iname, mapID)
-    DB.sessions[rid] = DB.sessions[rid] or { started = time(), instance = iname, mapID = mapID, players = {} }
+    DB.sessions[rid] = DB.sessions[rid] or
+        { started = time(), instance = iname, mapID = mapID, players = {}, combatSeconds = 0 }
     return DB.sessions[rid]
 end
 
@@ -225,6 +233,12 @@ function RDC.TotalDeaths(snap)
     local sum = 0
     for _, e in ipairs(snap or RDC.GetSnapshot()) do sum = sum + e.deaths end
     return sum
+end
+
+-- Seconds the raid has spent in combat this lockout. Not wall clock: see the inCombat declaration for why.
+function RDC.GetCombatSeconds()
+    local s = ActiveSession()
+    return (s and s.combatSeconds) or 0
 end
 
 function RDC.GetInstanceName()
@@ -644,16 +658,22 @@ local batch = {}   -- deaths found this tick, flushed as ONE message. Reused rat
 
 local function Sweep()
     if not DB.currentRaidID then return end
-    if not InRaidInstance() then wasInRaid = false; return end
+    -- Clearing inCombat on the way out matters: without it, zoning out mid-fight and returning hours later
+    -- would bank the entire absence as combat time on the first tick back.
+    if not InRaidInstance() then wasInRaid = false; inCombat = false; return end
     if not wasInRaid then
         wasInRaid = true
         wipe(prevDead)   -- re-baseline on entry so already-dead state (including a world death we
                          -- corpse-walked in with) is recorded, not counted as a fresh death this tick
     end
     wipe(batch)
+    local anyCombat = false
     for _, unit in ipairs(watched) do
         local name = FullName(unit)
         if name then
+            -- Raid-level rather than our own flag alone. A dead player is out of combat, so gating on
+            -- "player" would stop the clock exactly when a fight is going worst.
+            if not anyCombat and UnitAffectingCombat(unit) then anyCombat = true end
             local dead = UnitIsDeadOrGhost(unit) and not (UnitIsFeignDeath and UnitIsFeignDeath(unit))
             local was = prevDead[name]
             if was == nil then
@@ -667,6 +687,17 @@ local function Sweep()
             end
         end
     end
+    -- Banked against the PREVIOUS tick's state, so a segment is only counted once both of its ends are
+    -- known. The first tick of a fight therefore adds nothing, which is where the stated +/-0.5s per
+    -- combat segment comes from. Incremental rather than banked at combat end, so a disconnect mid-pull
+    -- costs one tick instead of the whole fight.
+    local now = GetTime()
+    local sess = ActiveSession()
+    if sess and inCombat and lastCombatTick then
+        sess.combatSeconds = (sess.combatSeconds or 0) + (now - lastCombatTick)
+    end
+    inCombat, lastCombatTick = anyCombat, now
+
     -- One flush for the whole tick, so a 25-man wipe is one message rather than 25, and one repaint
     -- rather than 25.
     if #batch > 0 then
@@ -716,6 +747,7 @@ local function CheckLockout(s, iname)
     if newLockout then
         wipe(s.players)
         s.started = now
+        s.combatSeconds = 0   -- or last week's fighting stays in the denominator for the whole new week
         s.lockID, s.lockResetAt = nil, nil
         wipe(prevDead)                    -- counts restart, so the baselines have to as well
         RefreshHUD()
@@ -938,7 +970,7 @@ end
 function RDC.ResetCurrent()
     if not DB or not DB.currentRaidID then return end
     local s = DB.sessions[DB.currentRaidID]
-    if s then wipe(s.players) end
+    if s then wipe(s.players); s.combatSeconds = 0 end
     wipe(prevDead)
     RefreshHUD()
     print("|cff88bbffRaidDeathCount|r current raid counts cleared.")
@@ -1054,8 +1086,15 @@ frame:SetScript("OnUpdate", function(_, elapsed)
 end)
 
 -- ── Debug ─────────────────────────────────────────────────────────────────────
--- /run RaidDeathCount.DebugDump()
-function RDC.DebugDump()
+-- Split into sections because the combined dump outgrew a readable chat window. Each is callable on its
+-- own for a targeted check; DebugDump still prints all four, which is what to paste when reporting a
+-- problem. All /run only, deliberately: none of this belongs on the slash command surface.
+--   /run RaidDeathCount.DebugRaid()     instance, RaidID, lockouts, stored sessions
+--   /run RaidDeathCount.DebugTimer()    combat timer
+--   /run RaidDeathCount.DebugComms()    comms health, digests, last outage
+--   /run RaidDeathCount.DebugMemory()   addon memory
+--   /run RaidDeathCount.DebugDump()     all of the above
+function RDC.DebugRaid()
     local iname, itype, _, _, _, _, _, mapID = GetInstanceInfo()
     print("|cff88bbffRDC|r instance:", iname, "type:", itype, "mapID:", mapID)
     local rid = ResolveRaidID()
@@ -1070,8 +1109,14 @@ function RDC.DebugDump()
     local n = (GetNumSavedInstances and GetNumSavedInstances()) or 0
     print("|cff88bbffRDC|r saved instances:", n)
     for i = 1, n do
-        local name, id, reset, diff, locked = GetSavedInstanceInfo(i)
-        print(("  [%d] %s id=%s reset=%s diff=%s locked=%s"):format(i, tostring(name), tostring(id), tostring(reset), tostring(diff), tostring(locked)))
+        -- Positions 11 and 12 are numEncounters/encounterProgress, confirmed populated on 2.5.6 (a cleared
+        -- SSC reads 6/6). Informational only: a "raid complete" flag was considered for stopping the combat
+        -- timer and dropped, because a timer that only runs in combat already freezes when the raid ends,
+        -- making the flag a label rather than a mechanism.
+        local name, id, reset, diff, locked, _, _, _, _, _, encounters, progress = GetSavedInstanceInfo(i)
+        print(("  [%d] %s id=%s reset=%s diff=%s locked=%s progress=%s/%s"):format(
+            i, tostring(name), tostring(id), tostring(reset), tostring(diff), tostring(locked),
+            tostring(progress), tostring(encounters)))
     end
     -- All sessions, so a stranded raidID's counts are visible and not just the active one's.
     print("|cff88bbffRDC|r sessions in DB:")
@@ -1082,6 +1127,17 @@ function RDC.DebugDump()
             tostring(id), tostring(sess.instance), tostring(sess.mapID), tostring(sess.lockID), np, total,
             id == DB.currentRaidID and "  <== ACTIVE" or ""))
     end
+end
+
+-- inRaidInstance is on this line because it gates accumulation: a timer that is not moving during a fight
+-- is explained by that reading before anything else.
+function RDC.DebugTimer()
+    local cs = RDC.GetCombatSeconds()
+    print(("|cff88bbffRDC|r combat timer: %.1fs (%dm %02ds)  inCombat=%s  inRaidInstance=%s"):format(
+        cs, math.floor(cs / 60), math.floor(cs % 60), tostring(inCombat), tostring(InRaidInstance())))
+end
+
+function RDC.DebugComms()
     -- Comms health. The echo column is the one that matters: it is the only reading that separates "we
     -- went deaf" from "nobody else here", which the sync count alone cannot do.
     local h = RDC.GetCommsHealth()
@@ -1119,16 +1175,26 @@ function RDC.DebugDump()
             (h.lastOutage.to or 0) - (h.lastOutage.from or 0), RDC.Ago(h.lastOutage.to),
             h.lastOutage.reasserts or 0, (h.lastOutage.reasserts == 1) and "" or "s"))
     end
+end
 
-    -- Last line so it stays on screen: chat scrolls the oldest print out of view first.
-    -- GetAddOnMemoryUsage reads a cached figure that only refreshes on demand, so without the update
-    -- call it reports whatever the last consumer of the API happened to leave behind.
+-- GetAddOnMemoryUsage reads a cached figure that only refreshes on demand, so without the update call it
+-- reports whatever the last consumer of the API happened to leave behind.
+function RDC.DebugMemory()
     local update = (C_AddOns and C_AddOns.UpdateAddOnMemoryUsage) or UpdateAddOnMemoryUsage
     local usage  = (C_AddOns and C_AddOns.GetAddOnMemoryUsage) or GetAddOnMemoryUsage
     if update and usage then
         update()
         print(("|cff88bbffRDC|r memory: %.1f KB"):format(usage(ADDON_NAME) or 0))
     end
+end
+
+-- Everything, in the order that reads best in chat. Memory stays last because chat scrolls the oldest
+-- print out of view first, so the shortest line is the one worth keeping on screen.
+function RDC.DebugDump()
+    RDC.DebugRaid()
+    RDC.DebugTimer()
+    RDC.DebugComms()
+    RDC.DebugMemory()
 end
 
 -- Manual recovery for counts orphaned by an old RaidID bug:
