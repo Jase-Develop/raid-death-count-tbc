@@ -137,6 +137,8 @@ end
 -- traffic rides INSTANCE_CHAT, so a send to RAID never leaves the client: the heartbeat's echo cannot come
 -- back, the watchdog times out and reports a false outage on a loop for the whole match. Comms are
 -- suppressed outright rather than switched to INSTANCE_CHAT, because reaching that group is not wanted.
+-- SendComm no longer consults this, since gating comms on being IN a raid instance already excludes a BG,
+-- but the watchdog still needs to tell "we chose not to send" apart from "the channel is broken".
 local function InPvPInstance()
     local _, itype = IsInInstance()
     return itype == "pvp" or itype == "arena"
@@ -298,7 +300,14 @@ end
 -- Returns true only when a message actually went out. The watchdog needs that: arming an echo probe for a
 -- send that never happened (ungrouped) would time out and report a fake outage.
 local function SendComm(msg)
-    if InPvPInstance() then return false end   -- see InPvPInstance: unreachable group, and probing it lies
+    -- Syncing only ever makes sense from inside the raid itself. The RaidID is a mapID and nothing else, so
+    -- it says WHERE but never WHICH RUN: two clients sticky on the same instance from different nights are
+    -- indistinguishable to it. Comms being group scoped was assumed to cover that, on the reasoning that
+    -- any group you are in is your raid, and a 5-man dungeon with mates is the counterexample. Party chat
+    -- carried a peer's raid counts straight into a client that had merely walked through that instance
+    -- once. Physically standing in the instance is the one condition stickiness cannot fake, so gate on it.
+    -- Subsumes the old battleground and arena suppression, neither of which is a raid either.
+    if not InRaidInstance() then return false end
     local ch = GroupChannel()
     if not ch then return false end
     if C_ChatInfo and C_ChatInfo.SendAddonMessage then
@@ -628,6 +637,11 @@ end
 local function OnComm(msg, sender)
     local rid, op, payload = msg:match("^(.-)|(.-)|(.*)$")
     if not rid then return end
+    -- The mirror of the send gate, and it has to exist independently rather than trusting peers to stay
+    -- quiet: through any staged rollout a peer still on <= 0.7.2 keeps broadcasting from a dungeon, and our
+    -- own gate is the only thing that can refuse it. Ahead of NoteInbound deliberately, since traffic from
+    -- a group that is not a raid is not ours to count as evidence the channel works.
+    if not InRaidInstance() then return end
     NoteInbound(sender)                      -- before the RaidID filter: hearing anything proves the path
     if rid ~= DB.currentRaidID then return end
     TouchPeer(sender, op, payload)
@@ -1174,6 +1188,10 @@ function RDC.DebugComms()
     -- First, because it explains every other figure on the line: nothing is sent or expected in here.
     if InPvPInstance() then
         state = "SUSPENDED (battleground/arena)"
+    elseif not InRaidInstance() then
+        -- The usual reason for silence now, and the one most likely to be read as a fault: outside the
+        -- instance nothing is sent and nothing inbound is accepted, by design.
+        state = "SUSPENDED (not in a raid instance)"
     elseif h.ok == false then
         state = ("DOWN since %s, %d re-asserts"):format(RDC.Ago(h.brokenSince), h.reasserts)
     elseif h.ok then
