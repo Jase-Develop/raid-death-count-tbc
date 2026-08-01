@@ -153,8 +153,37 @@ local function MakeFlatButton(parent, w, h, label, fontSize, tooltip)
     tx:SetPoint("CENTER")
     tx:SetText(label)
     tx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+
+    -- Three distinct states, because a menu needs to show which entry is chosen while still reacting to the
+    -- cursor: dim = idle, bright = hovered, bright + a coloured border = the current selection. An optional
+    -- tint carries a per-button colour (the channel dropdown gives each entry its own chat colour); nil
+    -- keeps the THEME dim/accent pair, so buttons that set neither tint nor MarkActive are unchanged.
+    local tint
+    local function restColor()
+        if tint then
+            if b.active then tx:SetTextColor(tint[1], tint[2], tint[3])
+            else tx:SetTextColor(tint[1] * 0.55, tint[2] * 0.55, tint[3] * 0.55) end
+        else
+            local c = b.active and THEME.text or THEME.dim
+            tx:SetTextColor(c[1], c[2], c[3])
+        end
+    end
+    function b:MarkActive(on)
+        self.active = on or nil
+        -- Hover already takes the text to full colour, so a tinted button needs a second channel to say
+        -- "chosen" or the two states are indistinguishable under the cursor. The border is that channel.
+        if tint and self.SetBackdropBorderColor then
+            local c = on and tint or THEME.border
+            self:SetBackdropBorderColor(c[1], c[2], c[3], 1)
+        end
+        restColor()
+    end
+    function b:SetTint(c) tint = c; self:MarkActive(self.active) end
+    function b:SetLabel(s) tx:SetText(s) end
+
     b:SetScript("OnEnter", function(self)
-        tx:SetTextColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
+        local c = tint or THEME.accent
+        tx:SetTextColor(c[1], c[2], c[3])
         if tooltip then
             GameTooltip:SetOwner(self, "ANCHOR_TOP")
             GameTooltip:SetText(tooltip)
@@ -162,7 +191,7 @@ local function MakeFlatButton(parent, w, h, label, fontSize, tooltip)
         end
     end)
     b:SetScript("OnLeave", function()
-        tx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+        restColor()
         if tooltip then GameTooltip:Hide() end   -- only ours to hide; a tooltipless button leaves it alone
     end)
     return b
@@ -303,6 +332,60 @@ panelTitle:SetPoint("LEFT", panelHeader, "LEFT", 5, 0)
 panelTitle:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
 panelTitle:SetText("Reports")
 
+-- ── Report channel dropdown ───────────────────────────────────────────────────
+-- Lives in the panel's title bar, not as a fourth row of buttons, so choosing a channel costs the panel no
+-- extra height. That rules out UIDropDownMenu on size alone before its taint and styling come into it: it
+-- is ~32px tall with a ~115px minimum width and cannot fit an 18px header at all. This is the same widget
+-- hand-rolled from the flat button already in the file, at a size that fits.
+local CHAN_BTN_W, CHAN_BTN_H = 58, HEADER_H - 4
+
+-- Blizzard's own default chat colours, so an entry reads as the chat it targets rather than as an arbitrary
+-- palette the user has to learn. Hardcoded rather than read from ChatTypeInfo: that would track a user's
+-- recoloured chat, but it also lets a customised near-black guild colour render the entry unreadable here.
+local CHAN_COLOR = {
+    RAID  = { 1.00, 0.50, 0.00 },   -- orange
+    PARTY = { 0.67, 0.67, 1.00 },   -- blue
+    GUILD = { 0.25, 1.00, 0.25 },   -- green
+}
+
+local chanBtn = MakeFlatButton(panelHeader, CHAN_BTN_W, CHAN_BTN_H, "Raid", 10, "Report channel")
+chanBtn:SetPoint("RIGHT", panelHeader, "RIGHT", -3, 0)
+chanBtn:MarkActive(true)   -- the collapsed button is the current channel, so it always shows at full colour
+
+-- A child of the panel, so it travels, hides and gets destroyed with it for free. Frame level rather than
+-- strata to sit above the report buttons: they are children of the same panel, so a shared strata already
+-- orders correctly and a higher strata would only risk outranking things it has no business covering.
+local chanMenu = CreateFrame("Frame", "RaidDeathCount_ChannelMenu", panel, "BackdropTemplate")
+chanMenu:SetSize(CHAN_BTN_W + 4, 4 + #RDC.CHANNEL_ORDER * CHAN_BTN_H)
+chanMenu:SetPoint("TOPRIGHT", chanBtn, "BOTTOMRIGHT", 0, -2)
+chanMenu:SetFrameLevel(panel:GetFrameLevel() + 10)
+ApplyFlat(chanMenu, THEME.panel, true)
+chanMenu:Hide()
+
+local chanItems = {}
+for i, key in ipairs(RDC.CHANNEL_ORDER) do
+    local item = MakeFlatButton(chanMenu, CHAN_BTN_W, CHAN_BTN_H, RDC.REPORT_CHANNELS[key], 10)
+    item:SetPoint("TOPLEFT", chanMenu, "TOPLEFT", 2, -2 - (i - 1) * CHAN_BTN_H)
+    item:SetTint(CHAN_COLOR[key])
+    item:SetScript("OnClick", function()
+        chanMenu:Hide()
+        RDC.SetReportChannel(key)   -- which calls RefreshReportChannel below to repaint this menu
+    end)
+    chanItems[key] = item
+end
+
+-- Named on RDC because the core writes the setting (slash command) and has to be able to repaint the UI.
+function RDC.RefreshReportChannel()
+    local cur = RDC.GetReportChannel()
+    chanBtn:SetLabel(RDC.REPORT_CHANNELS[cur])
+    chanBtn:SetTint(CHAN_COLOR[cur])
+    for key, item in pairs(chanItems) do item:MarkActive(key == cur) end
+end
+
+chanBtn:SetScript("OnClick", function()
+    if chanMenu:IsShown() then chanMenu:Hide() else chanMenu:Show() end
+end)
+
 for i, r in ipairs(REPORTS) do
     local label, mode = r[1], r[2]
     local col, row = (i - 1) % PANEL_COLS, math.floor((i - 1) / PANEL_COLS)
@@ -341,6 +424,11 @@ header:HookScript("OnDragStart", function() panel:Hide() end)
 -- Hiding the HUD hides the panel with it as a child, but a child keeps its own shown flag, so without this
 -- closing the HUD mid-panel and reopening it would bring the panel back uninvited.
 hud:HookScript("OnHide", function() panel:Hide() end)
+
+-- Same trap as the panel/HUD pair above: the menu is a child so it vanishes with the panel, but it keeps
+-- its own shown flag, and without this the next open would come back with the menu still hanging open.
+-- This is also what makes Escape close the menu, since Escape hides the panel.
+panel:HookScript("OnHide", function() chanMenu:Hide() end)
 
 -- Escape closes it like any other transient window. This is why the frame is globally named.
 if UISpecialFrames then table.insert(UISpecialFrames, "RaidDeathCount_ReportPanel") end
@@ -646,6 +734,7 @@ function RDC.InitHUD()
         hud:SetPoint(db.point, UIParent, db.relPoint, db.x or 0, db.y or 0)
     end
     RefreshLock()
+    RDC.RefreshReportChannel()   -- the saved channel exists only now, so the dropdown is built showing "Raid"
     if db.shown == nil then db.shown = true end   -- visible by default, Details-style
     if db.shown then hud:Show() else hud:Hide() end
     RDC.RefreshHUD()

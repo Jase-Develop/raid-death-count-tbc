@@ -818,13 +818,52 @@ local function ClassLabel(class)
     return class:sub(1, 1) .. class:sub(2):lower()
 end
 
+-- Where reports go. Account-wide with the other UI prefs, because it is a preference about this client's
+-- chat rather than data about a raid, so it has no business in the per-character session store.
+-- "RAID" resolves through GroupChannel rather than sending to RAID literally, which keeps the default
+-- byte-identical to what shipped before there was a choice. "PARTY" means the raid subgroup.
+local REPORT_CHANNELS = { RAID = "Raid", PARTY = "Party", GUILD = "Guild" }
+RDC.REPORT_CHANNELS = REPORT_CHANNELS
+RDC.CHANNEL_ORDER   = { "RAID", "PARTY", "GUILD" }   -- display order; the table above has no order of its own
+
+function RDC.GetReportChannel()
+    local c = RaidDeathCountDB and RaidDeathCountDB.reportChannel
+    return REPORT_CHANNELS[c] and c or "RAID"
+end
+
+function RDC.SetReportChannel(c)
+    c = c and c:upper() or ""
+    if not REPORT_CHANNELS[c] then return false end
+    if RaidDeathCountDB then RaidDeathCountDB.reportChannel = c end
+    if RDC.RefreshReportChannel then RDC.RefreshReportChannel() end   -- core loads first, so guard it
+    return true
+end
+
+-- A choice we cannot honour prints locally instead of falling back to another channel: quietly
+-- redirecting a guild-intended report into raid chat, or the reverse, is a far worse failure than only
+-- the sender seeing it.
+local function ResolveReportChannel(want)
+    if want == "GUILD" then return IsInGuild() and "GUILD" or nil end
+    if want == "PARTY" then return IsInGroup() and "PARTY" or nil end
+    return GroupChannel()
+end
+
+local lastChannelWarn = 0
+
 local function ReportLine(text)
-    local ch = GroupChannel()
+    local want = RDC.GetReportChannel()
+    local ch = ResolveReportChannel(want)
     if ch then
         SendChatMessage(text, ch)
-    else
-        print("|cff88bbffRaidDeathCount|r " .. text)
+        return
     end
+    -- Throttled, or "report all" repeats the warning on all 25 lines. Deliberately silent on RAID: falling
+    -- back to a local print when ungrouped is what this always did, and it is obvious on screen.
+    if want ~= "RAID" and GetTime() - lastChannelWarn > 5 then
+        lastChannelWarn = GetTime()
+        print(("|cff88bbffRaidDeathCount|r Not in %s chat, printing locally."):format(REPORT_CHANNELS[want]:lower()))
+    end
+    print("|cff88bbffRaidDeathCount|r " .. text)
 end
 
 -- Reports one player straight from a snapshot row. The HUD calls this for a ctrl-clicked row rather than
@@ -1210,6 +1249,13 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
 
     if cmd == "report" then
         RDC.Report(rest ~= "" and rest or "all")
+    elseif cmd == "channel" then
+        if rest ~= "" and not RDC.SetReportChannel(rest) then
+            print("|cff88bbffRaidDeathCount|r channel must be raid, party or guild.")
+        else
+            print(("|cff88bbffRaidDeathCount|r reporting to %s chat.")
+                :format(RDC.REPORT_CHANNELS[RDC.GetReportChannel()]:lower()))
+        end
     elseif cmd == "lock" then
         if RDC.ToggleLock then RDC.ToggleLock() end
     elseif cmd == "minimap" then
@@ -1223,7 +1269,8 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
     else
         print("|cff88bbffRaidDeathCount|r v" .. RDC.GetVersion() .. " commands:")
         print("  /rdc                toggle the HUD")
-        print("  /rdc report [<name>|top3|top5|least|total|class|all]   report to party/raid")
+        print("  /rdc report [<name>|top3|top5|least|total|class|all]   report to chat")
+        print("  /rdc channel [raid|party|guild]   where reports are sent")
         print("  /rdc lock           lock/unlock HUD move + resize")
         print("  /rdc minimap        show/hide the minimap button")
         print("  /rdc demo           toggle sample data for a UI preview")
