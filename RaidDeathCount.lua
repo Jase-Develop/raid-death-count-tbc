@@ -38,6 +38,10 @@ local lastResyncAsk = 0       -- time() of the last resync request we KNOW ABOUT
                               -- counts because "?" is a broadcast: their replies heal us too, so a second
                               -- request adds traffic and nothing else (see DIGEST_COOLDOWN).
 local wasInRaid  = false      -- were we inside the raid instance last sweep (re-baseline on re-entry)
+local deathLog   = false      -- diagnostic printing of every death edge and every remote raise, toggled by
+                              -- RDC.DebugDeaths(). Exists to separate a genuine death from a
+                              -- UnitIsDeadOrGhost flicker: merge by MAX spreads one client's miscount to the
+                              -- entire raid, so the only useful question is which client produced the number.
 
 -- Combat timer. Measures seconds the RAID spent fighting, not wall clock, which is what makes it survive a
 -- multi-night lockout with no gap rule: the hours between Tuesday and Thursday simply are not counted.
@@ -92,6 +96,31 @@ local function RebuildWatched()
     else
         watched[#watched + 1] = "player"
     end
+end
+
+-- Death-edge diagnostics. Both read their own API values inside the guard so nothing is evaluated while
+-- logging is off, which matters because a wipe hits these 25 times in one tick.
+--
+-- The decisive reading is the PAIR of lines, not the death on its own: a real death is a single DEATH, while
+-- a flicker in UnitIsDeadOrGhost is DEATH / alive / DEATH a tick or two apart. conn and vis separate the two
+-- causes of an alive edge, a resurrection from the unit's data merely going unavailable.
+local function LogDeathEdge(kind, name, unit, total, own)
+    if not deathLog then return end
+    print(("|cff88bbffRDC|r |cffaaaaaa%s.%d|r %s %s (%s)%s dead=%s ghost=%s conn=%s vis=%s"):format(
+        date("%H:%M:%S"), math.floor(GetTime() * 10) % 10, kind, name, unit,
+        -- own alongside the merged total is the readout that verifies the split: our own sightings should
+        -- track the real death count even while the total carries a peer's higher number.
+        total and (" -> " .. total .. " (own " .. tostring(own) .. ")") or "",
+        tostring(UnitIsDead(unit)), tostring(UnitIsGhost(unit)),
+        tostring(UnitIsConnected(unit)), tostring(UnitIsVisible(unit))))
+end
+
+-- Logged only when the merge actually RAISED our count, since that is the one case that changes what the HUD
+-- shows. Names the sender, which is what localises a miscount to a client without instrumenting every install.
+local function LogRemoteRaise(op, name, deaths, sender)
+    if not deathLog then return end
+    print(("|cff88bbffRDC|r |cffaaaaaa%s.%d|r remote %s %s -> %s from %s"):format(
+        date("%H:%M:%S"), math.floor(GetTime() * 10) % 10, op, name, tostring(deaths), tostring(sender)))
 end
 
 -- ── RaidID (sync scope) ───────────────────────────────────────────────────────
@@ -178,23 +207,41 @@ end
 -- from one client in a single frame, from every client at once. That is far over the server's
 -- addon-message rate limit, so the excess is dropped exactly when the counts matter most. The caller
 -- flushes the whole tick as one message instead.
+--
+-- `own` counts only what THIS client witnessed and is what gets incremented; `deaths` is the merged value
+-- shown and sent. Keeping them apart is not tidiness, it is the whole correctness argument. Incrementing
+-- `deaths` directly stacks our own sighting on top of the number a peer just sent for the SAME death, so
+-- one death inflates once per addon user in the raid: A broadcasts 1, B merges to 1 then its own sweep
+-- makes it 2, C merges to 2 then makes it 3. Ordering-dependent, invisible solo, and MAX then spreads the
+-- highest result to everyone. Confirmed live 2026-08-02 from a `remote D -> 4` immediately followed by a
+-- local edge producing 5 for a single death.
 local function RecordDeath(name, class)
     local s = ActiveSession()
     if not s then return end
     local p = s.players[name]
-    if not p then p = { class = class, deaths = 0 }; s.players[name] = p end
+    if not p then p = { class = class, deaths = 0, own = 0 }; s.players[name] = p end
     if class then p.class = class end
-    p.deaths = p.deaths + 1
-    return p.deaths, p.class   -- the STORED class, which may be one we learned earlier when this read is nil
+    -- Absent `own` means a row written before this field existed. Defaulting to `deaths` is exactly right
+    -- for the single-client case (where every count WAS our own) and is the conservative choice for a row
+    -- already inflated by the old bug: starting from 0 instead would park us below the merged value and
+    -- silently swallow real deaths until we climbed back past it.
+    p.own = (p.own or p.deaths) + 1
+    if p.own > p.deaths then p.deaths = p.own end
+    -- class is the STORED one, which may be from an earlier sighting when this read is nil. own is returned
+    -- for the diagnostic log only.
+    return p.deaths, p.class, p.own
 end
 
 -- Merge by MAX. Counts only rise within a raid, so every client converges without dedup, ordering or
 -- authority, which is what makes late-join, reconnect and duplicate messages self-heal.
+--
+-- Deliberately does NOT touch `own`: a peer's number is not something we witnessed, and letting it raise our
+-- own counter is precisely the compounding this split exists to stop.
 local function ApplyRemote(name, class, deaths)
     local s = ActiveSession()
     if not s or not name or not deaths then return false end
     local p = s.players[name]
-    if not p then p = { class = class, deaths = 0 }; s.players[name] = p end
+    if not p then p = { class = class, deaths = 0, own = 0 }; s.players[name] = p end
     if class and class ~= "" then p.class = class end
     if deaths > p.deaths then
         p.deaths = deaths
@@ -647,11 +694,17 @@ local function OnComm(msg, sender)
     TouchPeer(sender, op, payload)
     if op == "D" then
         local name, class, deaths = payload:match("^(.-),(.-),(%d+)$")
-        if name and ApplyRemote(name, class, tonumber(deaths)) then RefreshHUD() end
+        if name and ApplyRemote(name, class, tonumber(deaths)) then
+            LogRemoteRaise("D", name, deaths, sender)
+            RefreshHUD()
+        end
     elseif op == "S" then
         local changed = false
         for name, class, deaths in payload:gmatch("([^,;]+),([^,;]*),(%d+);?") do
-            if ApplyRemote(name, class, tonumber(deaths)) then changed = true end
+            if ApplyRemote(name, class, tonumber(deaths)) then
+                LogRemoteRaise("S", name, deaths, sender)
+                changed = true
+            end
         end
         if changed then RefreshHUD() end
     elseif op == "?" then
@@ -694,9 +747,11 @@ local function Sweep()
                 prevDead[name] = dead            -- first sight: baseline only, we did not witness it
             elseif dead and not was then
                 prevDead[name] = true
-                local total, cls = RecordDeath(name, select(2, UnitClass(unit)))
+                local total, cls, own = RecordDeath(name, select(2, UnitClass(unit)))
                 if total then batch[#batch + 1] = Entry(name, cls, total) end
+                LogDeathEdge("DEATH", name, unit, total, own)
             elseif not dead then
+                if was then LogDeathEdge("alive", name, unit, nil) end
                 prevDead[name] = false
             end
         end
@@ -725,9 +780,13 @@ end
 local function MergeSession(from, to)
     for name, p in pairs(from.players) do
         local q = to.players[name]
-        if not q then q = { class = p.class, deaths = 0 }; to.players[name] = q end
+        if not q then q = { class = p.class, deaths = 0, own = 0 }; to.players[name] = q end
         if p.class and p.class ~= "" then q.class = p.class end
         if (p.deaths or 0) > (q.deaths or 0) then q.deaths = p.deaths end
+        -- Carried by MAX like the count itself. Both sides are the same client's own sightings, so the
+        -- larger is the better record; dropping it would let the row default `own` back to `deaths` and
+        -- re-inherit a peer's number as if we had seen it ourselves.
+        if (p.own or 0) > (q.own or 0) then q.own = p.own end
     end
 end
 
@@ -1178,6 +1237,15 @@ function RDC.DebugTimer()
     local cs = RDC.GetCombatSeconds()
     print(("|cff88bbffRDC|r combat timer: %.1fs (%dm %02ds)  inCombat=%s  inRaidInstance=%s"):format(
         cs, math.floor(cs / 60), math.floor(cs % 60), tostring(inCombat), tostring(InRaidInstance())))
+end
+
+-- In memory only, so it is off again after a /reload. Deliberate: this prints on every death of every fight,
+-- which is not something to leave running by accident for a whole raid night.
+function RDC.DebugDeaths()
+    deathLog = not deathLog
+    print("|cff88bbffRDC|r death edge logging " .. (deathLog and "|cff44ff44ON|r" or "|cffff4444OFF|r")
+        .. " (off again after /reload)")
+    return deathLog
 end
 
 function RDC.DebugComms()
