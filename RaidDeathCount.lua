@@ -923,11 +923,48 @@ end
 
 local lastChannelWarn = 0
 
+-- Report lines are paced, never sent as a burst of SendChatMessage inside one frame. A Top 5 is six lines,
+-- and sent together the server delivered them as header,2,3,4,5,1: every rank number correct, the order
+-- wrong, all six stamped the same second. Chat sent that fast has no delivery-order guarantee, and
+-- "report all" in a full raid is 27 lines rather than six, so this gets worse exactly where it is most
+-- public. The channel is resolved when the line is QUEUED and carried with it, not re-resolved at send
+-- time: a report is issued as a unit, and leaving the group midway through one should not send its tail
+-- somewhere else.
+local CHAT_INTERVAL = 0.25
+local chatQueue, chatNextAt = {}, 0
+
+-- An idle queue sends immediately, so a one-line report (a ctrl-clicked row, "report total") is never
+-- delayed by pacing it is the only occupant of, and a multi-line one still puts its header on screen at
+-- once. That instant first line is also what stops an impatient re-click turning a slow report into three
+-- interleaved ones.
+local function QueueChat(text, ch)
+    local now = GetTime()
+    if #chatQueue == 0 and now >= chatNextAt then
+        chatNextAt = now + CHAT_INTERVAL
+        SendChatMessage(text, ch)
+        return
+    end
+    chatQueue[#chatQueue + 1] = { text = text, ch = ch }
+end
+
+-- Driven from the OnUpdate below, which must call this ahead of its POLL_INTERVAL gate: behind it the
+-- queue could only drain every 0.5s and CHAT_INTERVAL would mean nothing.
+local function DrainChat()
+    if #chatQueue == 0 then return end
+    local now = GetTime()
+    if now < chatNextAt then return end
+    -- Measured from the actual send, not the scheduled one, so a frame hitch stretches the gap rather
+    -- than banking credit and firing a burst to catch up, which is the thing being prevented.
+    chatNextAt = now + CHAT_INTERVAL
+    local m = table.remove(chatQueue, 1)
+    SendChatMessage(m.text, m.ch)
+end
+
 local function ReportLine(text)
     local want = RDC.GetReportChannel()
     local ch = ResolveReportChannel(want)
     if ch then
-        SendChatMessage(text, ch)
+        QueueChat(text, ch)
         return
     end
     -- Throttled, or "report all" repeats the warning on all 25 lines. Deliberately silent on RAID: falling
@@ -1160,6 +1197,7 @@ end)
 
 local acc = 0
 frame:SetScript("OnUpdate", function(_, elapsed)
+    DrainChat()   -- ahead of the gate on purpose: behind it the queue drains no faster than POLL_INTERVAL
     acc = acc + elapsed
     if acc < POLL_INTERVAL then return end
     acc = 0
