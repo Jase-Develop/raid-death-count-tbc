@@ -203,10 +203,17 @@ end
 local reportBtn = MakeFlatButton(header, HEADER_H - 4, HEADER_H - 4, "R", 10, "Reports")
 reportBtn:SetPoint("RIGHT", lockBtn, "LEFT", -2, 0)
 
+-- The S pays for its own 16px rather than costing them. It is here, not in the report-hud, because it
+-- toggles a persistent display rather than firing an action, and the width it costs is more than covered by
+-- the total moving out of the title and into the stats-hud: "Karazhan (Total: 42)" renders ~104px against
+-- ~44px for "Karazhan", so the header comes out ahead of where it was.
+local statsBtn = MakeFlatButton(header, HEADER_H - 4, HEADER_H - 4, "S", 10, "Stats")
+statsBtn:SetPoint("RIGHT", reportBtn, "LEFT", -2, 0)
+
 -- Dot + count of addons in sync (us + live peers). Hidden when ungrouped, where the number is always 1.
 local syncTag = CreateFrame("Frame", nil, header)
 syncTag:SetSize(26, HEADER_H - 4)
-syncTag:SetPoint("RIGHT", reportBtn, "LEFT", -5, 0)
+syncTag:SetPoint("RIGHT", statsBtn, "LEFT", -5, 0)
 syncTag:EnableMouse(true)
 local syncDot = syncTag:CreateTexture(nil, "OVERLAY")
 syncDot:SetSize(9, 9)
@@ -296,26 +303,156 @@ syncTag:SetScript("OnEnter", function(self)
 end)
 syncTag:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
+-- ── Stats HUD ─────────────────────────────────────────────────────────────────
+-- A persistent strip under the death-hud, toggled by the header's S. Anchored to both bottom corners, so it
+-- is the death-hud's width for free and stays that width through a resize; a child of it, so it travels and
+-- hides with it the same way the report-hud does.
+--
+-- One deliberate difference from the report-hud: a child keeps its own shown flag, and here that is WANTED.
+-- The report-hud needs an OnHide hook so closing the death-hud mid-panel does not bring it back uninvited;
+-- the stats-hud is a display rather than a transient menu, so coming back exactly as you left it is right,
+-- and the saved statsShown pref is what carries that across a reload.
+local STATS_H      = PAD * 2 + HEADER_H
+local LABEL_MIN_W  = 190   -- below this the labels are dropped and the values kept: see RefreshStats
+
+local statsHUD = CreateFrame("Frame", "RaidDeathCount_StatsHUD", hud, "BackdropTemplate")
+statsHUD:SetHeight(STATS_H)
+statsHUD:SetPoint("TOPLEFT", hud, "BOTTOMLEFT", 0, -2)
+statsHUD:SetPoint("TOPRIGHT", hud, "BOTTOMRIGHT", 0, -2)
+ApplyFlat(statsHUD, THEME.bg, true)
+-- Same reason the death-hud body enables the mouse with no drag handler: swallow clicks rather than letting
+-- them fall through to the world behind. Dragging stays the death-hud title bar's job.
+statsHUD:EnableMouse(true)
+statsHUD:Hide()
+
+local statsStrip = CreateFrame("Frame", nil, statsHUD, "BackdropTemplate")
+statsStrip:SetHeight(HEADER_H)
+statsStrip:SetPoint("TOPLEFT", statsHUD, "TOPLEFT", PAD, -PAD)
+statsStrip:SetPoint("TOPRIGHT", statsHUD, "TOPRIGHT", -PAD, -PAD)
+ApplyFlat(statsStrip, THEME.panel, true)
+
+local deathsLabel = statsStrip:CreateFontString(nil, "OVERLAY")
+ApplyFont(deathsLabel, 10)
+deathsLabel:SetPoint("LEFT", statsStrip, "LEFT", 5, 0)
+deathsLabel:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+deathsLabel:SetText("Deaths")
+
+-- Anchored to the label's right edge, so blanking the label collapses the gap with it. That is why the
+-- narrow-width path sets the text to "" rather than hiding the string: a hidden FontString keeps its
+-- width, and the value would sit in the same place with nothing in front of it.
+local deathsValue = statsStrip:CreateFontString(nil, "OVERLAY")
+ApplyFont(deathsValue, 11)
+deathsValue:SetPoint("LEFT", deathsLabel, "RIGHT", 4, 0)
+deathsValue:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+
+-- Centred between the two inputs it is measured against, so the strip reads left to right as deaths, time,
+-- then the figure derived from them. DPM in the middle would sit the result between its own operands.
+local timerValue = statsStrip:CreateFontString(nil, "OVERLAY")
+ApplyFont(timerValue, 11)
+timerValue:SetPoint("CENTER", statsStrip, "CENTER", 0, 0)
+timerValue:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+
+-- Mirror of the deaths cell: the VALUE holds the anchor and the label hangs off its left, so blanking the
+-- label at narrow widths collapses inwards and leaves the number against the strip edge where it belongs.
+local dpmValue = statsStrip:CreateFontString(nil, "OVERLAY")
+ApplyFont(dpmValue, 11)
+dpmValue:SetPoint("RIGHT", statsStrip, "RIGHT", -5, 0)
+dpmValue:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+
+local dpmLabel = statsStrip:CreateFontString(nil, "OVERLAY")
+ApplyFont(dpmLabel, 10)
+dpmLabel:SetPoint("RIGHT", dpmValue, "LEFT", -4, 0)
+dpmLabel:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+dpmLabel:SetText("DPM")
+
+-- Both formatters live in the core, shared with "/rdc report stats" so the chat line and this strip cannot
+-- disagree over rounding. Aliased to locals here because they are read on a once-a-second path.
+local FormatClock, FormatDPM = RDC.FormatClock, RDC.FormatDPM
+
+-- Full repaint, driven by events (a death, a resize, a merge) rather than by the clock. RefreshHUD already
+-- has the summed total, so it passes it in: recomputing it here would rebuild and re-sort a snapshot the
+-- caller is holding. The clock is the only value that moves with no event behind it, and it is updated by
+-- the tick below instead, which is what keeps this off the once-a-second path.
+-- Cached for the tick below, which needs the total to recompute DPM and must not rebuild and re-sort a
+-- snapshot to get it. Every path that changes the total goes through RefreshHUD, so this cannot go stale
+-- while the strip is up, and showing the strip calls RefreshStats before the tick can read it.
+local lastDeathSum = 0
+
+local function RefreshStats(deathSum)
+    if not statsHUD:IsShown() then return end
+    -- Measured on the death-hud, not the strip: they are equal by construction and the strip's anchors
+    -- have not resolved yet while a resize is still in flight.
+    local labels = hud:GetWidth() >= LABEL_MIN_W
+    lastDeathSum = deathSum or RDC.TotalDeaths()
+    deathsLabel:SetText(labels and "Deaths" or "")
+    dpmLabel:SetText(labels and "DPM" or "")
+    deathsValue:SetText(lastDeathSum)
+    timerValue:SetText(FormatClock(RDC.GetCombatSeconds()))
+    dpmValue:SetText(FormatDPM(lastDeathSum, RDC.GetCombatSeconds()))
+end
+
+-- WoW does not fire OnUpdate on a hidden frame, so hanging the driver on the stats-hud itself makes "only
+-- runs while shown" fall out of the frame hierarchy: hiding the strip or the death-hud above it stops the
+-- tick with no start/stop bookkeeping to get wrong.
+--
+-- DPM gets a slower beat than the clock on purpose. Its rate of change is -60*D/t^2, so early in a pull the
+-- second decimal moves several units a second, which is noise on a figure nobody reads mid-fight. Out of
+-- combat no beat is needed at all: both inputs are frozen, so one tick after the fight ends the number is
+-- exact and stays that way for as long as it is being looked at, which is when it is actually read.
+local DPM_INTERVAL = 5
+local statsAcc, dpmAcc = 0, 0
+statsHUD:SetScript("OnUpdate", function(_, elapsed)
+    dpmAcc = dpmAcc + elapsed
+    if dpmAcc >= DPM_INTERVAL then
+        dpmAcc = 0
+        dpmValue:SetText(FormatDPM(lastDeathSum, RDC.GetCombatSeconds()))
+    end
+    statsAcc = statsAcc + elapsed
+    if statsAcc < 1 then return end
+    statsAcc = 0
+    timerValue:SetText(FormatClock(RDC.GetCombatSeconds()))
+end)
+
+-- Account-wide alongside the other UI prefs, per the per-character/account split: which panels this client
+-- has open is a preference, not data about a raid. Defaults off, so an upgrade does not grow new furniture
+-- under everyone's HUD unasked.
+function RDC.SetStatsShown(show)
+    show = show and true or false
+    local db = DB(); if db then db.statsShown = show end
+    statsHUD:SetShown(show)
+    statsBtn:MarkActive(show or nil)
+    if show then RefreshStats() end
+end
+
+function RDC.IsStatsShown() return statsHUD:IsShown() end
+
+function RDC.ToggleStats() RDC.SetStatsShown(not statsHUD:IsShown()) end
+
+statsBtn:SetScript("OnClick", function() RDC.ToggleStats() end)
+
 -- ── Report panel ──────────────────────────────────────────────────────────────
 -- Every reporting action in one place, so the header does not have to grow a button per mode. A child of
 -- the HUD, which buys travelling with it and hiding with it for nothing, and deliberately transient: it
 -- keeps no saved position, so unlike the HUD there is no way for it to end up stranded off screen.
-local PANEL_BTN_W, PANEL_BTN_H, PANEL_GAP, PANEL_COLS = 56, 18, 3, 3
+-- No button width here on purpose: the report-hud matches the death-hud's width, so the buttons are what
+-- flexes to fill it. Only the height is fixed, since the row count is.
+local PANEL_BTN_H, PANEL_GAP, PANEL_COLS = 18, 3, 3
 
 -- No tooltips: the labels say what they do, unlike the header's lone R.
 local REPORTS = {
     { "All",      "all"   },
     { "Top 3",    "top3"  },
     { "Top 5",    "top5"  },
-    { "Total",    "total" },
+    { "Stats",    "stats" },
     { "Fewest",   "least" },
     { "By Class", "class" },
 }
 
 local panelRows = math.ceil(#REPORTS / PANEL_COLS)
 local panel = CreateFrame("Frame", "RaidDeathCount_ReportPanel", hud, "BackdropTemplate")
-panel:SetSize(PAD * 2 + PANEL_COLS * PANEL_BTN_W + (PANEL_COLS - 1) * PANEL_GAP,
-              PAD * 2 + HEADER_H + PANEL_GAP + panelRows * PANEL_BTN_H + (panelRows - 1) * PANEL_GAP)
+-- Height only. The width comes from anchoring both sides to the death-hud in PositionPanel, which is what
+-- keeps all three huds the same width through a resize.
+panel:SetHeight(PAD * 2 + HEADER_H + PANEL_GAP + panelRows * PANEL_BTN_H + (panelRows - 1) * PANEL_GAP)
 panel:SetFrameStrata("DIALOG")   -- opens outside the HUD bounds, so it must not sit under other windows
 ApplyFlat(panel, THEME.bg, true)
 panel:Hide()
@@ -386,29 +523,57 @@ chanBtn:SetScript("OnClick", function()
     if chanMenu:IsShown() then chanMenu:Hide() else chanMenu:Show() end
 end)
 
+local panelButtons = {}
 for i, r in ipairs(REPORTS) do
     local label, mode = r[1], r[2]
-    local col, row = (i - 1) % PANEL_COLS, math.floor((i - 1) / PANEL_COLS)
-    local b = MakeFlatButton(panel, PANEL_BTN_W, PANEL_BTN_H, label, 10)
-    b:SetPoint("TOPLEFT", panelHeader, "BOTTOMLEFT",
-               col * (PANEL_BTN_W + PANEL_GAP), -PANEL_GAP - row * (PANEL_BTN_H + PANEL_GAP))
+    -- Width is a placeholder: LayoutPanelButtons owns it, and cannot run yet because the panel has no
+    -- width of its own until PositionPanel anchors it to the death-hud.
+    local b = MakeFlatButton(panel, 1, PANEL_BTN_H, label, 10)
     b:SetScript("OnClick", function()
         panel:Hide()
         RDC.Report(mode)
     end)
+    panelButtons[i] = b
 end
+
+-- The buttons divide whatever width the death-hud currently is, rather than the panel sizing itself to fit
+-- them. Driven from the panel's OWN OnSizeChanged, which needs no coordination with the death-hud's resize
+-- path: the panel is anchored to both of its sides, so dragging the grip resizes the panel, and that fires
+-- this. Widths are fractional and left unrounded, so six buttons cannot accumulate a visible drift against
+-- the right edge the way six truncated integers would.
+local function LayoutPanelButtons()
+    local inner = panel:GetWidth() - PAD * 2
+    if inner <= 0 then return end   -- anchors not resolved yet; OnSizeChanged calls back once they are
+    local w = (inner - (PANEL_COLS - 1) * PANEL_GAP) / PANEL_COLS
+    for i, b in ipairs(panelButtons) do
+        local col, row = (i - 1) % PANEL_COLS, math.floor((i - 1) / PANEL_COLS)
+        b:SetWidth(w)
+        b:ClearAllPoints()
+        b:SetPoint("TOPLEFT", panelHeader, "BOTTOMLEFT",
+                   col * (w + PANEL_GAP), -PANEL_GAP - row * (PANEL_BTN_H + PANEL_GAP))
+    end
+end
+panel:SetScript("OnSizeChanged", LayoutPanelButtons)
 
 -- Sits above the HUD, dropping below only when there is no room above, so a HUD parked at the top of the
 -- screen does not open the panel off it. Recomputed on every open rather than cached, since the HUD moves
 -- and resizes freely between one open and the next.
+-- Both horizontal anchors, not one: that is what makes the panel the death-hud's width instead of its own,
+-- and it has to be re-established on every open because ClearAllPoints drops the pair.
 local function PositionPanel()
     panel:ClearAllPoints()
     local top, screenH = hud:GetTop(), UIParent:GetHeight()
     if top and screenH and top + panel:GetHeight() + 2 > screenH then
-        panel:SetPoint("TOPRIGHT", hud, "BOTTOMRIGHT", 0, -2)
+        -- Clears the stats-hud when that is out, or the report-hud drops straight on top of it. Read at
+        -- open time like everything else here, since the strip can be toggled between one open and the next.
+        local below = statsHUD:IsShown() and statsHUD or hud
+        panel:SetPoint("TOPLEFT",  below, "BOTTOMLEFT",  0, -2)
+        panel:SetPoint("TOPRIGHT", below, "BOTTOMRIGHT", 0, -2)
     else
+        panel:SetPoint("BOTTOMLEFT",  hud, "TOPLEFT",  0, 2)
         panel:SetPoint("BOTTOMRIGHT", hud, "TOPRIGHT", 0, 2)
     end
+    LayoutPanelButtons()   -- harmless if the anchors have not resolved: OnSizeChanged calls back when they do
 end
 
 reportBtn:SetScript("OnClick", function()
@@ -702,9 +867,12 @@ function RDC.RefreshHUD()
         end
     end
 
+    -- The total lives in the stats-hud now, not here. Duplicating it cost the header ~60px it does not have
+    -- at MIN_W, where the title already collides with the buttons.
     local inst = ShortInstance(RDC.GetInstanceName(), RDC.GetMapID())
-    title:SetText(inst and (inst .. " (Total: " .. deathSum .. ")") or "Raid Death Count")
+    title:SetText(inst or "Raid Death Count")
 
+    RefreshStats(deathSum)
     UpdateSyncTag()
 end
 
@@ -735,6 +903,7 @@ function RDC.InitHUD()
     end
     RefreshLock()
     RDC.RefreshReportChannel()   -- the saved channel exists only now, so the dropdown is built showing "Raid"
+    RDC.SetStatsShown(db.statsShown)   -- nil on first run reads as off, which is the intended default
     if db.shown == nil then db.shown = true end   -- visible by default, Details-style
     if db.shown then hud:Show() else hud:Hide() end
     RDC.RefreshHUD()

@@ -290,6 +290,26 @@ function RDC.GetCombatSeconds()
     return (s and s.combatSeconds) or 0
 end
 
+-- Both formatters live here rather than in the UI because the stats-hud and "/rdc report stats" render the
+-- same two figures, and a raider comparing the chat line against the bar on screen must not find them
+-- disagreeing over rounding or precision. The core loads first, so the UI can call these freely.
+
+-- Fixed width so the strip does not reflow every time the clock crosses ten minutes. Hours are not wrapped:
+-- combat time accumulates across a whole lockout, so a week of raiding can legitimately pass 24.
+function RDC.FormatClock(sec)
+    sec = math.floor(sec or 0)
+    return ("%02d:%02d:%02d"):format(math.floor(sec / 3600), math.floor(sec / 60) % 60, sec % 60)
+end
+
+-- Deaths per minute OF COMBAT, not of wall clock, since that is what the denominator measures. A zero
+-- denominator reads 0.00 rather than blank or a dash: the figure is always populated, and the alternative
+-- for deaths-with-no-combat-time is an infinity there is no sensible way to print. Demo mode is the case
+-- that shows it, having rows but no clock.
+function RDC.FormatDPM(deaths, sec)
+    if not sec or sec <= 0 then return "0.00" end
+    return ("%.2f"):format((deaths or 0) * 60 / sec)
+end
+
 function RDC.GetInstanceName()
     if RDC.demoData then return "Demo Preview" end
     local s = ActiveSession()
@@ -933,7 +953,7 @@ local lastChannelWarn = 0
 local CHAT_INTERVAL = 0.25
 local chatQueue, chatNextAt = {}, 0
 
--- An idle queue sends immediately, so a one-line report (a ctrl-clicked row, "report total") is never
+-- An idle queue sends immediately, so a one-line report (a ctrl-clicked row, "report stats") is never
 -- delayed by pacing it is the only occupant of, and a multi-line one still puts its header on screen at
 -- once. That instant first line is also what stops an impatient re-click turning a slow report into three
 -- interleaved ones.
@@ -990,7 +1010,7 @@ end
 -- Anything NOT in here is treated as a player-name prefix, so a new keyword must be added or
 -- "/rdc report <keyword>" silently searches for a player of that name instead.
 local REPORT_MODES = {
-    all = true, top3 = true, top5 = true, total = true,
+    all = true, top3 = true, top5 = true, stats = true, total = true,   -- total: retired alias for stats
     least = true, lowest = true, class = true, classes = true,
 }
 
@@ -1017,20 +1037,31 @@ local function FewestCandidates(snap)
     return out
 end
 
--- mode = "all" | "top3" | "top5" | "total" | "least" (alias "lowest") | "class" (alias "classes")
---        | a player-name prefix.
+-- mode = "all" | "top3" | "top5" | "stats" (alias "total") | "least" (alias "lowest")
+--        | "class" (alias "classes") | a player-name prefix.
 function RDC.Report(mode)
     local snap = RDC.GetSnapshot()
-    if #snap == 0 then ReportLine("No deaths recorded yet.") return end
 
     -- Keywords match case insensitively; mode itself stays as typed so a miss can echo the name back.
     local key = mode and mode:lower() or "all"
 
-    if key == "total" then
+    -- Deliberately AHEAD of the empty guard below, unlike every other mode. A night with no deaths is a
+    -- result worth posting here, and the combat time next to it is what makes it one: "0 deaths in 00:42:10"
+    -- is the report a clean run wants, where the other modes genuinely have nothing to list.
+    --
+    -- "total" is kept as an alias rather than removed. It shipped as a documented command and may sit in
+    -- someone's macro, and this output is a superset of what it printed, so the rename costs its callers
+    -- nothing. A keyword that silently became a player-name search would be the same kind of quietly broken
+    -- command that got "/rdc reset" deleted.
+    if key == "stats" or key == "total" then
         local total = RDC.TotalDeaths(snap)
-        ReportLine(("Raid Death Count: %d total death%s"):format(total, total == 1 and "" or "s"))
+        local sec   = RDC.GetCombatSeconds()
+        ReportLine(("Raid Death Count: %d death%s in %s of combat (%s deaths per min)"):format(
+            total, total == 1 and "" or "s", RDC.FormatClock(sec), RDC.FormatDPM(total, sec)))
         return
     end
+
+    if #snap == 0 then ReportLine("No deaths recorded yet.") return end
 
     -- Deaths summed per class instead of per player. Snapshot-based, unlike "least" below: a class with
     -- nobody dead has nothing to say, whereas a player with no deaths is the whole point of that command.
@@ -1382,6 +1413,8 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
         end
     elseif cmd == "lock" then
         if RDC.ToggleLock then RDC.ToggleLock() end
+    elseif cmd == "stats" then
+        if RDC.ToggleStats then RDC.ToggleStats() end
     elseif cmd == "minimap" then
         if RDC.ToggleMinimap then RDC.ToggleMinimap() end
     elseif cmd == "demo" then
@@ -1393,9 +1426,10 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
     else
         print("|cff88bbffRaidDeathCount|r v" .. RDC.GetVersion() .. " commands:")
         print("  /rdc                toggle the HUD")
-        print("  /rdc report [<name>|top3|top5|least|total|class|all]   report to chat")
+        print("  /rdc report [<name>|top3|top5|least|stats|class|all]   report to chat")
         print("  /rdc channel [raid|party|guild]   where reports are sent")
         print("  /rdc lock           lock/unlock HUD move + resize")
+        print("  /rdc stats          show/hide the stats bar under the HUD")
         print("  /rdc minimap        show/hide the minimap button")
         print("  /rdc demo           toggle sample data for a UI preview")
         print("  /rdc version        print the addon version")

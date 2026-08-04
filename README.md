@@ -19,10 +19,15 @@ deaths. No dependencies, no setup, no configuration to get wrong.
 
 - Rows sorted by deaths, with a class-coloured bar behind each one. **Ctrl+click a row** to report just
   that player to chat. The bar brightens under the cursor to show a row is clickable.
-- Header buttons, right to left: close, lock, **R** to open the reports panel, and a sync indicator
-  showing how many raiders are running the addon. Hover it for details.
-- The **R** panel holds every report in one place: all, top 3, top 5, the raid total, fewest deaths, and
-  a per-class breakdown. Pick one and it posts to chat and closes.
+- Header buttons, right to left: close, lock, **R** to open the reports panel, **S** to toggle the stats
+  bar, and a sync indicator showing how many raiders are running the addon. Hover it for details.
+- The **R** panel holds every report in one place: all, top 3, top 5, stats, fewest deaths, and a per-class
+  breakdown. Pick one and it posts to chat and closes. **Stats** posts the same three figures the **S** bar
+  shows, as one line.
+- The **S** bar sits under the HUD at the same width and stays there until you close it, showing the raid
+  total, time spent in combat, and deaths per minute. Combat time only counts while the raid is actually
+  fighting, so it pauses between pulls and across the trip back from a wipe, and DPM is measured against
+  that same fighting time rather than against the length of the night.
 - Scrolls with the mouse wheel when more players die than fit, so you can keep the frame small.
 - Unlock it to drag by the title bar and resize from the bottom-right corner. Clicking a row will not
   move it.
@@ -39,10 +44,11 @@ deaths. No dependencies, no setup, no configuration to get wrong.
 | Command | Does |
 | --- | --- |
 | `/rdc` | Show or hide the HUD. |
-| `/rdc report` | Post counts to raid chat, or wherever `/rdc channel` points. Add `top3`, `top5`, `least`, `total` or `class` to narrow it. |
+| `/rdc report` | Post counts to raid chat, or wherever `/rdc channel` points. Add `top3`, `top5`, `least`, `stats` or `class` to narrow it. |
 | `/rdc report <name>` | Post one player's count. Ctrl+clicking their row in the HUD does the same thing. |
 | `/rdc channel [raid\|party\|guild]` | Choose where reports are posted, or print the current choice. The dropdown in the reports panel does the same thing. |
 | `/rdc lock` | Lock or unlock moving and resizing. |
+| `/rdc stats` | Show or hide the stats bar under the HUD. The **S** header button does the same thing. |
 | `/rdc minimap` | Show or hide the minimap button. |
 | `/rdc demo` | Fill the HUD with sample data for a look around. Never touches real counts. |
 | `/rdc version` | Print the version. |
