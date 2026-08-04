@@ -893,13 +893,29 @@ local function UpdateRaidID()
         RequestResync()
         RefreshHUD()
     else
-        local s = ActiveSession()
-        if s then
-            if iname and iname ~= "" then
-                if not s.instance or s.instance == "" then s.instance = iname end
-                if not s.mapID then s.mapID = mapID end   -- backfill for sessions written by older code
-            end
-            CheckLockout(s, iname)
+        -- EnsureSession, not ActiveSession. The two are identical in normal operation, since the branch
+        -- above mints the session at the moment it sets the id. Nothing defends that invariant from the
+        -- outside though, and losing the session while the id still points at it is unrecoverable without
+        -- this: the id never changes, so the branch that would rebuild it is never reached again, and every
+        -- sweep from then on has nowhere to record. Counting stops dead with no error printed anywhere,
+        -- which is the worst shape a fault can have. Confirmed 2026-08-04 from a hand-cleared session that
+        -- left a live raid silently uncounted. Rebuilding here is free when the session is present.
+        local missing = not DB.sessions[rid]
+        local s = EnsureSession(rid, iname, mapID)
+        if iname and iname ~= "" then
+            if not s.instance or s.instance == "" then s.instance = iname end
+            if not s.mapID then s.mapID = mapID end   -- backfill for sessions written by older code
+        end
+        CheckLockout(s, iname)
+
+        -- A session minted here needs the same footing the switch branch gives a new one, or the heal is
+        -- only half done: re-baseline the death latch so nobody already on the floor is counted for a death
+        -- that predates the session, ask peers for what they hold, and repaint. Fires once, because the
+        -- next tick finds the session present.
+        if missing then
+            wipe(prevDead)
+            RequestResync()
+            RefreshHUD()
         end
     end
 end
