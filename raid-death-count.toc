@@ -1,7 +1,7 @@
 ## Interface: 20506
 ## Title: Raid Death Count
 ## Notes: A lean HUD that tracks and syncs per-player death counts in a raid (TBC 2.5.6)
-## Version: 0.7.5
+## Version: 0.8
 ## SavedVariables: RaidDeathCountDB
 ## SavedVariablesPerCharacter: RaidDeathCountCharDB
 
