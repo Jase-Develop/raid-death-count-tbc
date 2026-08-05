@@ -19,6 +19,12 @@ local PROBE_RETRY   = 10                   -- seconds between probes while broke
                                            -- so recovery is timestamped sharply enough to be evidence
 local DIGEST_COOLDOWN = 60                 -- min seconds between resyncs triggered by a digest mismatch, so
                                            -- a raid that all disagrees at once cannot storm the channel
+local STALE_SESSION = 6 * 60 * 60          -- seconds of inactivity after which an UNSTAMPED session (a night
+                                           -- that never killed a boss, so it was never saved) is wiped on
+                                           -- next contact. See CheckLockout: only sessions with no lockout
+                                           -- stamp decay, since those are the only ones with no reset of
+                                           -- their own. Comfortably longer than any within-night break and
+                                           -- shorter than a return the next evening.
 
 -- ── State ─────────────────────────────────────────────────────────────────────
 local DB                      -- = RaidDeathCountCharDB, PER CHARACTER (set at ADDON_LOADED): sessions +
@@ -782,6 +788,11 @@ local function Sweep()
     -- costs one tick instead of the whole fight.
     local now = GetTime()
     local sess = ActiveSession()
+    -- Marks the session as still being played, for the unstamped-session decay in CheckLockout. Wall clock,
+    -- not GetTime(), because it has to survive a logout. Stamped per tick rather than per death, so a long
+    -- deathless attempt still reads as activity; Sweep has already returned unless we are physically inside
+    -- the raid, which is exactly the condition that should count as playing it.
+    if sess then sess.lastSeen = time() end
     if sess and inCombat and lastCombatTick then
         sess.combatSeconds = (sess.combatSeconds or 0) + (now - lastCombatTick)
     end
@@ -825,10 +836,17 @@ end
 --   1. the lockout the counts were recorded under has passed its reset time (the weekly reset)
 --   2. we are saved to a DIFFERENT lockout id than the one they were recorded under (raided again)
 -- Neither can misfire on a blank saved-instance read, hence no grace window: (1) reads only stored data,
--- (2) needs a real id in hand.
--- KNOWN GAP: a session that never saw a boss kill was never saved, carries no stamp, and so survives into
--- the following week. Needs a whole night with zero kills to hit, and since /rdc reset was removed there is
--- no manual clear: it resolves itself once a boss kill stamps the session, or on entering a different raid.
+-- (2) needs a real id in hand. A third signal covers the sessions the first two cannot see at all:
+--   3. the session carries NO stamp and has not been played in STALE_SESSION seconds
+-- A night that killed no boss was never saved, so it has no lockout of its own and neither (1) nor (2) can
+-- ever fire for it: the counts are not merely stranded for the week, they are carried into the NEXT real
+-- lockout, because stamping an unstamped session does not wipe it. Reported live 2026-08-05 from a pug that
+-- wiped without a kill and was still showing those deaths days later to a completely different group.
+-- Decay is gated on the session being unstamped, and that gate is the whole design rather than a
+-- heuristic: no lockout means there is no continuity to protect, whereas a STAMPED session legitimately
+-- spans a week (clear on Tuesday, continue on Thursday) and must never decay, for the same reason
+-- combatSeconds concatenates across nights. Derived locally like the other two, so every client reaches
+-- the same verdict with nothing crossing the wire and nobody holding authority.
 local function CheckLockout(s, iname)
     if not s then return end
     local id, resetIn = FindLockout(iname or s.instance)
@@ -838,15 +856,42 @@ local function CheckLockout(s, iname)
     if s.lockResetAt and now >= s.lockResetAt then newLockout = true end   -- (1) our lockout expired
     if id and s.lockID and id ~= s.lockID then newLockout = true end       -- (2) saved to a different one
 
-    if newLockout then
+    -- lastSeen is absent on sessions written before it existed, so fall back to `started`: for a night
+    -- that has already gone stale those are the same evening, which is why old bad data clears itself on
+    -- the next visit. Cannot fire on a session being played, since Sweep re-stamps it every 0.5s.
+    --
+    -- The empty check is not an optimisation, it stops the message repeating forever. Unlike (1) and (2),
+    -- which re-stamp themselves silent immediately below, a decay leaves the session unstamped, so its own
+    -- fresh `started` goes stale again 6 hours later and it announces another reset of nothing. Parked in
+    -- town that recurs for as long as the character exists. An empty session has nothing to reset, so it
+    -- has no business claiming it did.
+    local unstamped = not s.lockID and not s.lockResetAt
+    local hasData = next(s.players or {}) ~= nil or (s.combatSeconds or 0) > 0
+    local stale = unstamped and hasData
+                  and (now - (s.lastSeen or s.started or now)) >= STALE_SESSION   -- (3)
+
+    if newLockout or stale then
+        -- Counted before the wipe: a decay is the one reset the player has no way to anticipate, since it
+        -- can fire at login or on the heartbeat in town with no zoning to explain it. Naming the number
+        -- discarded is what separates "the addon did a thing" from "the addon lost my raid".
+        local cleared = 0
+        for _, p in pairs(s.players) do cleared = cleared + (p.deaths or 0) end
         wipe(s.players)
         s.started = now
         s.combatSeconds = 0   -- or last week's fighting stays in the denominator for the whole new week
         s.lockID, s.lockResetAt = nil, nil
+        s.lastSeen = nil
         wipe(prevDead)                    -- counts restart, so the baselines have to as well
         RefreshHUD()
-        print(("|cff88bbffRaid Death Count|r new lockout for %s: counts reset."):format(
-            tostring(s.instance or iname or "this raid")))
+        local label = tostring(s.instance or iname or "this raid")
+        if stale then
+            -- Says WHY as well as what, because the trigger is invisible: no boss was killed, so there was
+            -- no lockout to hang the counts on. Without that the reset reads as data loss.
+            print(("|cff88bbffRaid Death Count|r %s was left unfinished (no boss killed) and idle over "
+                .. "%d hours: %d deaths cleared."):format(label, STALE_SESSION / 3600, cleared))
+        else
+            print(("|cff88bbffRaid Death Count|r new lockout for %s: counts reset."):format(label))
+        end
     end
 
     -- Also re-stamps a session we just wiped, anchoring the fresh counts to the current reset. resetIn is
@@ -1310,8 +1355,14 @@ function RDC.DebugRaid()
     for id, sess in pairs(DB and DB.sessions or {}) do
         local total, np = 0, 0
         for _, p in pairs(sess.players or {}) do total = total + (p.deaths or 0); np = np + 1 end
-        print(("  <%s> instance=%s mapID=%s lock=%s players=%d totalDeaths=%d%s"):format(
-            tostring(id), tostring(sess.instance), tostring(sess.mapID), tostring(sess.lockID), np, total,
+        -- Idle time explains a decay before anything else does, and it is the only visible difference
+        -- between a session that is about to be wiped on entry and one that will survive. A stranded
+        -- session is never checked while it is inactive, so a high idle here is expected, not a fault:
+        -- it decays at the moment re-entering that raid makes it active.
+        local seen = sess.lastSeen or sess.started
+        print(("  <%s> instance=%s mapID=%s lock=%s idle=%s players=%d totalDeaths=%d%s"):format(
+            tostring(id), tostring(sess.instance), tostring(sess.mapID), tostring(sess.lockID),
+            seen and ("%.1fh"):format((time() - seen) / 3600) or "?", np, total,
             id == DB.currentRaidID and "  <== ACTIVE" or ""))
     end
 end
