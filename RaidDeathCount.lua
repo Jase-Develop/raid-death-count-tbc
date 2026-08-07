@@ -25,6 +25,11 @@ local STALE_SESSION = 6 * 60 * 60          -- seconds of inactivity after which 
                                            -- stamp decay, since those are the only ones with no reset of
                                            -- their own. Comfortably longer than any within-night break and
                                            -- shorter than a return the next evening.
+local DEMO_COMBAT_SECONDS = 4354           -- 01:12:34, the clock demo mode substitutes for the real one. A
+                                           -- fixed number rather than a running one, so a screenshot of the
+                                           -- preview is reproducible. Over an hour on purpose: it is a
+                                           -- realistic figure for a lockout's combat time and it is the only
+                                           -- way the hours field of FormatClock appears in a preview at all.
 
 -- ── State ─────────────────────────────────────────────────────────────────────
 local DB                      -- = RaidDeathCountCharDB, PER CHARACTER (set at ADDON_LOADED): sessions +
@@ -291,7 +296,14 @@ function RDC.TotalDeaths(snap)
 end
 
 -- Seconds the raid has spent in combat this lockout. Not wall clock: see the inCombat declaration for why.
+--
+-- Demo-guarded like GetInstanceName and GetMapID, and for a stronger reason than either: demo mode fakes the
+-- rows but a real session's clock is whatever the character happens to hold, which in town is zero, so the
+-- preview showed 29 deaths against 00:00:00 and 0.00 DPM. That is not a plausible-looking preview, it is a
+-- stats strip that reads as broken. Every consumer of the clock goes through here (the strip, the DPM cell
+-- and "/rdc report stats"), so this is the one place it needs faking.
 function RDC.GetCombatSeconds()
+    if RDC.demoData then return DEMO_COMBAT_SECONDS end
     local s = ActiveSession()
     return (s and s.combatSeconds) or 0
 end
@@ -309,8 +321,8 @@ end
 
 -- Deaths per minute OF COMBAT, not of wall clock, since that is what the denominator measures. A zero
 -- denominator reads 0.00 rather than blank or a dash: the figure is always populated, and the alternative
--- for deaths-with-no-combat-time is an infinity there is no sensible way to print. Demo mode is the case
--- that shows it, having rows but no clock.
+-- for deaths-with-no-combat-time is an infinity there is no sensible way to print. Reachable whenever rows
+-- exist with no clock behind them, which is a resync from peers before this client has fought anything.
 function RDC.FormatDPM(deaths, sec)
     if not sec or sec <= 0 then return "0.00" end
     return ("%.2f"):format((deaths or 0) * 60 / sec)
@@ -1369,10 +1381,15 @@ end
 
 -- inRaidInstance is on this line because it gates accumulation: a timer that is not moving during a fight
 -- is explained by that reading before anything else.
+-- Reads the session directly rather than through RDC.GetCombatSeconds(), which substitutes a fixed clock
+-- under demo mode. This is the tool for a timer that looks wrong, so it must report the real accumulation
+-- and never the faked one; demo is called out on the line instead, since it explains what the HUD is showing.
 function RDC.DebugTimer()
-    local cs = RDC.GetCombatSeconds()
-    print(("|cff88bbffRDC|r combat timer: %.1fs (%dm %02ds)  inCombat=%s  inRaidInstance=%s"):format(
-        cs, math.floor(cs / 60), math.floor(cs % 60), tostring(inCombat), tostring(InRaidInstance())))
+    local s = ActiveSession()
+    local cs = (s and s.combatSeconds) or 0
+    print(("|cff88bbffRDC|r combat timer: %.1fs (%dm %02ds)  inCombat=%s  inRaidInstance=%s%s"):format(
+        cs, math.floor(cs / 60), math.floor(cs % 60), tostring(inCombat), tostring(InRaidInstance()),
+        RDC.demoData and "  (DEMO: hud shows " .. RDC.FormatClock(DEMO_COMBAT_SECONDS) .. ")" or ""))
 end
 
 -- In memory only, so it is off again after a /reload. Deliberate: this prints on every death of every fight,
