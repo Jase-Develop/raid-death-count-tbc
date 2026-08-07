@@ -11,6 +11,9 @@ local THEME = {
     text   = { 0.90,  0.90,  0.90,  1 },     -- body text
     dim    = { 0.55,  0.55,  0.55,  1 },     -- muted text
     accent = { 0.40,  0.73,  1.00,  1 },     -- highlight (blue)
+    field  = { 0.16,  0.16,  0.16,  1 },     -- a well: checkbox interiors and the options close button,
+                                             -- one step lighter than `panel` so it reads on the title strip
+    offRed = { 0.78,  0.25,  0.25,  1 },     -- an "off" toggle, and the HUD title while recording is off
 }
 local FONT = "Fonts\\ARIALN.TTF"
 local FONT_FB = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
@@ -94,6 +97,21 @@ header:SetScript("OnDragStart", function()
     hud:StartMoving()
 end)
 header:SetScript("OnDragStop", function() hud:StopMovingOrSizing(); SavePlacement() end)
+
+-- Speaks only while recording is off, so hovering the bar to drag it is unchanged in normal operation. A
+-- HUD still showing counts while nothing is being recorded is a lie, and RefreshEnabledState reddening the
+-- title says something is wrong without saying what, so the header answers when asked. No width is spent:
+-- the header is the frame that already collides with its own title at MIN_W, which is why the report modes
+-- moved into a panel, so a disabled marker could not be a badge or a longer title.
+header:SetScript("OnEnter", function(self)
+    if not RDC.IsEnabled or RDC.IsEnabled() then return end
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Recording is off", THEME.offRed[1], THEME.offRed[2], THEME.offRed[3])
+    GameTooltip:AddLine("No deaths are being counted, merged or broadcast.", 0.8, 0.8, 0.8, true)
+    GameTooltip:AddLine("Turn it back on in /rdc options.", 0.55, 0.55, 0.55, true)
+    GameTooltip:Show()
+end)
+header:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
 local title = header:CreateFontString(nil, "OVERLAY")
 ApplyFont(title, 12)
@@ -195,6 +213,34 @@ local function MakeFlatButton(parent, w, h, label, fontSize, tooltip)
         if tooltip then GameTooltip:Hide() end   -- only ours to hide; a tooltipless button leaves it alone
     end)
     return b
+end
+
+-- A flat checkbox: state is one always-shown inset fill, accent when on and red when off, so a row reads at
+-- a glance without the eye having to hunt for a tick. The look is borrowed from WarlockQol's StyleCheckbox,
+-- but built on a plain Button instead of UICheckButtonTemplate. That template's whole contribution here is
+-- art we would immediately strip, and it is an XML template, which this file avoids on the same grounds
+-- that got UIDropDownMenu rejected for the channel picker.
+--
+-- Like the original it deliberately wires NO OnClick of its own, because the caller's SetScript would
+-- silently replace it and the state would then never flip. The caller owns the click and calls SetChecked.
+local function MakeCheckbox(parent, size)
+    local cb = CreateFrame("Button", nil, parent, "BackdropTemplate")
+    cb:SetSize(size, size)
+    ApplyFlat(cb, THEME.field, true)
+
+    local fill = cb:CreateTexture(nil, "OVERLAY")
+    fill:SetTexture("Interface\\Buttons\\WHITE8X8")
+    fill:SetPoint("TOPLEFT",     cb, "TOPLEFT",      3, -3)
+    fill:SetPoint("BOTTOMRIGHT", cb, "BOTTOMRIGHT", -3,  3)
+
+    function cb:GetChecked() return self.checked and true or false end
+    function cb:SetChecked(on)
+        self.checked = on and true or nil
+        local c = self.checked and THEME.accent or THEME.offRed
+        fill:SetVertexColor(c[1], c[2], c[3])
+    end
+    cb:SetChecked(false)
+    return cb
 end
 
 -- One toggle where the A/3/5 buttons used to sit. The header is width constrained: at MIN_W the fixed
@@ -909,6 +955,247 @@ function RDC.InitHUD()
     RDC.RefreshHUD()
 end
 
+-- ── Options frame ─────────────────────────────────────────────────────────────
+-- Top-level on UIParent, NOT a child of the HUD the way the report panel is. The panel wants to travel and
+-- hide with the HUD; this one is opened from the minimap button, and the case where it is most wanted is
+-- exactly when the HUD is closed.
+--
+-- Saves its SIZE but not its position, which is a deliberate split rather than an oversight. Size is a
+-- lasting preference the user sets once; position is where the window happened to be dragged, and a
+-- remembered one can be stranded off screen the way the report panel's never can. It opens centred every
+-- time, at whatever size was last chosen. Also rejected: anchoring it to the minimap button, which reads as
+-- the natural home for a right-click menu and then hangs off the screen edge, the button orbiting a minimap
+-- that sits in a corner.
+--
+-- The size is stored PER CHARACTER, unlike the HUD's account-wide geometry, because that is what was asked
+-- for; it rides in RaidDeathCountCharDB.options alongside the master switch, which is per character for its
+-- own reasons (see the core).
+-- Default and MINIMUM are the same, so the window only ever grows, and that is what keeps the title bar
+-- safe to crowd: brand left, toggle group centred, close button right, none of them able to collide the way
+-- the HUD's header does at ITS minimum. The binding gap is the LEFT one, between the end of the brand and
+-- the start of the centred group, and at 640 it is comfortable but no longer generous. Two things eat it: a
+-- longer brand string, and a third toggle, since the group grows from its centre outwards in both
+-- directions. Check that gap before adding either, and never let the minimum drop below the default.
+local OPT_DEF_W, OPT_DEF_H = 640, 480
+local OPT_MIN_W, OPT_MIN_H = 640, 480
+local OPT_MAX_W, OPT_MAX_H = 940, 780   -- WarlockQol's grow limit
+
+-- Title-bar metrics lifted from WarlockQol so the two addons' windows read as a pair: a 30px strip, an 18px
+-- logo, the brand at 14pt and a 22px close button, with secondary labels at its caption size of 11.
+local OPT_TITLE_H  = 30
+local OPT_LOGO     = 18
+local OPT_BRAND_FS = 14
+local OPT_LABEL_FS = 11
+local OPT_CLOSE    = 22
+local OPT_BOX      = 20   -- WarlockQol's title-bar checkbox size (its in-page ones are 22)
+local OPT_LABEL_GAP = 6   -- label to its own box
+local OPT_GROUP_GAP = 28  -- one toggle to the next
+
+-- Per character, so it cannot use DB() above, which is the account-wide UI table. Resolved lazily rather
+-- than captured: the saved variables do not exist when this file loads.
+local function OptDB()
+    if not RaidDeathCountCharDB then return nil end
+    RaidDeathCountCharDB.options = RaidDeathCountCharDB.options or {}
+    return RaidDeathCountCharDB.options
+end
+
+local options = CreateFrame("Frame", "RaidDeathCount_Options", UIParent, "BackdropTemplate")
+options:SetSize(OPT_DEF_W, OPT_DEF_H)
+options:SetPoint("CENTER")
+options:SetFrameStrata("DIALOG")
+options:SetClampedToScreen(true)
+options:SetMovable(true)
+options:EnableMouse(true)   -- swallow clicks rather than passing them through to the world behind
+ApplyFlat(options, THEME.bg, true)
+options:Hide()
+
+-- SetResizeBounds is the modern call; the older pair is kept for the same reason the HUD keeps it.
+options:SetResizable(true)
+if options.SetResizeBounds then
+    options:SetResizeBounds(OPT_MIN_W, OPT_MIN_H, OPT_MAX_W, OPT_MAX_H)
+else
+    if options.SetMinResize then options:SetMinResize(OPT_MIN_W, OPT_MIN_H) end
+    if options.SetMaxResize then options:SetMaxResize(OPT_MAX_W, OPT_MAX_H) end
+end
+
+local optHeader = CreateFrame("Frame", nil, options, "BackdropTemplate")
+optHeader:SetHeight(OPT_TITLE_H)
+optHeader:SetPoint("TOPLEFT",  options, "TOPLEFT",   PAD, -PAD)
+optHeader:SetPoint("TOPRIGHT", options, "TOPRIGHT", -PAD, -PAD)
+ApplyFlat(optHeader, THEME.panel, true)
+
+-- Dragged by the title bar alone, like the HUD. Unlike the HUD it ignores the lock (that setting is about
+-- not disturbing a HUD placed for a fight) and saves nothing on drop.
+optHeader:EnableMouse(true)
+optHeader:RegisterForDrag("LeftButton")
+optHeader:SetScript("OnDragStart", function() options:StartMoving() end)
+optHeader:SetScript("OnDragStop",  function() options:StopMovingOrSizing() end)
+
+-- The same skull the minimap button wears, on the same TexCoord crop that trims the icon's baked-in border.
+-- Deliberately the same art rather than a second icon: it is what the user right-clicked to get here.
+local optLogo = optHeader:CreateTexture(nil, "OVERLAY")
+optLogo:SetSize(OPT_LOGO, OPT_LOGO)
+optLogo:SetPoint("LEFT", optHeader, "LEFT", 8, 0)
+optLogo:SetTexture("Interface\\Icons\\INV_Misc_Bone_HumanSkull_01")
+optLogo:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+-- Accent blue for the name, with the version in grey via an inline colour code, which is why the base
+-- colour is set here and not baked into the string: SetTextColor only reaches the uncoded run.
+local optTitle = optHeader:CreateFontString(nil, "OVERLAY")
+ApplyFont(optTitle, OPT_BRAND_FS)
+optTitle:SetPoint("LEFT", optLogo, "RIGHT", 6, 0)
+optTitle:SetTextColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
+optTitle:SetText("Raid Death Count")   -- version appended on open, see RefreshOptions
+
+-- WarlockQol's close button rather than this file's MakeFlatButton: at 22px on a 30px strip it is the piece
+-- that most carries the "same window" impression, and its accent X plus accent-border hover is the thing
+-- being matched. MakeFlatButton is built for a dim 14px header and looks undersized here.
+local optClose = CreateFrame("Button", nil, optHeader, "BackdropTemplate")
+optClose:SetSize(OPT_CLOSE, OPT_CLOSE)
+optClose:SetPoint("RIGHT", optHeader, "RIGHT", -4, 0)
+ApplyFlat(optClose, THEME.field, true)
+
+local optCloseX = optClose:CreateFontString(nil, "OVERLAY")
+ApplyFont(optCloseX, OPT_BRAND_FS)
+optCloseX:SetPoint("CENTER")
+optCloseX:SetText("X")
+optCloseX:SetTextColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
+
+optClose:SetScript("OnEnter", function(self)
+    self:SetBackdropBorderColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
+    optCloseX:SetTextColor(0.78, 0.88, 1.0)
+end)
+optClose:SetScript("OnLeave", function(self)
+    self:SetBackdropBorderColor(THEME.border[1], THEME.border[2], THEME.border[3])
+    optCloseX:SetTextColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
+end)
+optClose:SetScript("OnClick", function() options:Hide() end)
+
+-- Same grip as the HUD's, minus the lock check: the lock exists to stop a HUD placed for a fight being
+-- nudged mid-pull, which is not a hazard a settings window has.
+local optGrip = CreateFrame("Button", nil, options)
+optGrip:SetSize(14, 14)
+optGrip:SetPoint("BOTTOMRIGHT", options, "BOTTOMRIGHT", -2, 2)
+local optGripTx = optGrip:CreateTexture(nil, "OVERLAY")
+optGripTx:SetAllPoints()
+optGripTx:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+optGrip:SetScript("OnMouseDown", function() options:StartSizing("BOTTOMRIGHT") end)
+optGrip:SetScript("OnMouseUp", function()
+    options:StopMovingOrSizing()
+    local db = OptDB()
+    if db then db.width, db.height = options:GetWidth(), options:GetHeight() end
+end)
+
+-- ── Title-bar toggles ─────────────────────────────────────────────────────────
+-- The global switches live in the title bar, centred as one group, the way WarlockQol carries its master
+-- and minimap pair. They belong there rather than in the body because they are the two that apply to the
+-- whole addon and are wanted from anywhere; the body below is for settings that will scope to a feature.
+--
+-- The frame is NOT sized to its toggles, which an earlier version was: it is user-resizable now, so growing
+-- it per setting would fight the height the user chose and saved. The empty body is deliberate room.
+local optToggles = {}
+
+-- Re-laid out after every add rather than positioned at creation, because each new toggle moves the centre
+-- of the group and every earlier one has to shift left to keep it centred. The box hangs off its own
+-- label's right, so placing the label places the pair.
+local function LayoutToggles()
+    local total = 0
+    for i, t in ipairs(optToggles) do
+        total = total + t.label:GetStringWidth() + OPT_LABEL_GAP + OPT_BOX
+        if i > 1 then total = total + OPT_GROUP_GAP end
+    end
+    local x = -total / 2
+    for i, t in ipairs(optToggles) do
+        t.label:ClearAllPoints()
+        t.label:SetPoint("LEFT", optHeader, "CENTER", x, 0)
+        x = x + t.label:GetStringWidth() + OPT_LABEL_GAP + OPT_BOX
+        if i < #optToggles then x = x + OPT_GROUP_GAP end
+    end
+end
+
+-- get and set are passed as functions rather than values because the state lives elsewhere and can change
+-- behind a closed frame (a slash command, or the other toggle), and because the minimap accessors do not
+-- exist yet at this point in the file.
+local function AddToggle(label, tooltip, get, set)
+    local tx = optHeader:CreateFontString(nil, "OVERLAY")
+    ApplyFont(tx, OPT_LABEL_FS)
+    tx:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+    tx:SetText(label)   -- set before LayoutToggles, which measures the rendered string
+
+    local cb = MakeCheckbox(optHeader, OPT_BOX)
+    cb:SetPoint("LEFT", tx, "RIGHT", OPT_LABEL_GAP, 0)
+
+    -- The click lives here because MakeCheckbox deliberately wires none. Read the state back from get()
+    -- afterwards rather than assuming the flip took: a setter is free to refuse, and a checkbox showing a
+    -- state the addon is not in is worse than one that appears not to have responded.
+    cb:SetScript("OnClick", function(self)
+        set(not self:GetChecked())
+        self:SetChecked(get())
+    end)
+    cb:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOMLEFT")   -- downwards: the bar is at the top of the window
+        GameTooltip:SetText(label, THEME.text[1], THEME.text[2], THEME.text[3])
+        if tooltip then GameTooltip:AddLine(tooltip, 0.8, 0.8, 0.8, true) end
+        GameTooltip:Show()
+    end)
+    cb:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    optToggles[#optToggles + 1] = { label = tx, cb = cb, get = get }
+    LayoutToggles()
+    return cb
+end
+
+-- Read on every open rather than tracked as the frame's own state: every one of these can be changed while
+-- the frame is shut, by a slash command or by the HUD, and a stale checkbox is a lie about the addon.
+--
+-- The saved size is restored here too rather than from an init call at login, which is the whole reason
+-- this frame needs no PLAYER_LOGIN hook: it cannot be seen before it is shown, so first open is early
+-- enough. The version rides the title the same way, and is read here because it is one string per open.
+local function RefreshOptions()
+    local db = OptDB()
+    if db and db.width and db.height then options:SetSize(db.width, db.height) end
+    optTitle:SetText(("Raid Death Count  |cff888888v%s|r")
+        :format(RDC.GetVersion and RDC.GetVersion() or "?"))
+    for _, t in ipairs(optToggles) do t.cb:SetChecked(t.get()) end
+end
+options:SetScript("OnShow", RefreshOptions)
+
+-- Labels are bare nouns because the title bar has no room for sentences and the tooltip carries the
+-- meaning. That is the whole reason the tooltips stay: "Enabled" alone does not say that it stops inbound
+-- merges too, and that is exactly the part a user would be surprised by.
+AddToggle("Enabled",
+    "Off means nothing is recorded, merged from other players, or broadcast. Counts already stored are kept.",
+    function() return RDC.IsEnabled and RDC.IsEnabled() end,
+    function(on) if RDC.SetEnabled then RDC.SetEnabled(on) end end)
+
+-- Checked means SHOWN while the flag stored is `hidden`, so this pair is inverted and is easy to wire up
+-- backwards. The tooltip names the slash command on purpose: hiding the button removes the only other way
+-- back into this frame, so the escape hatch has to be visible at the moment it is being closed off.
+AddToggle("Minimap Icon",
+    "Show the Raid Death Count button on the minimap. Reachable again with /rdc options if you hide it.",
+    function() return not (RDC.IsMinimapHidden and RDC.IsMinimapHidden()) end,
+    function(on) if RDC.SetMinimapHidden then RDC.SetMinimapHidden(not on) end end)
+
+function RDC.ToggleOptions()
+    if options:IsShown() then options:Hide() else options:Show() end
+end
+
+-- The one repaint for the master switch, called by the core whenever it flips and once at login. Recolours
+-- the HUD title and re-syncs the open frame, so the checkbox, the slash command and the HUD cannot end up
+-- telling three different stories.
+function RDC.RefreshEnabledState()
+    local on = (not RDC.IsEnabled) or RDC.IsEnabled()
+    local c = on and THEME.text or THEME.offRed
+    title:SetTextColor(c[1], c[2], c[3])
+    if options:IsShown() then RefreshOptions() end
+    -- Late-bound through the RDC table because the minimap button is built further down this file, and
+    -- routed through here rather than called from each toggle site so the switch keeps ONE repaint.
+    if RDC.RefreshMinimapTint then RDC.RefreshMinimapTint() end
+end
+
+-- Escape closes it like any other transient window. This is why the frame is globally named.
+if UISpecialFrames then table.insert(UISpecialFrames, "RaidDeathCount_Options") end
+
 -- ── Minimap button ──────────────────────────────────────────────────────────────
 -- Hand-rolled rather than LibDBIcon, since the addon carries no libraries. Created at load but positioned
 -- and shown from RDC.InitMinimap on PLAYER_LOGIN, once the saved variables exist.
@@ -940,7 +1227,9 @@ do
     btn:SetSize(31, 31)
     btn:SetFrameStrata("MEDIUM")
     btn:SetFrameLevel(8)
-    btn:RegisterForClicks("LeftButtonUp")
+    -- Right-click opens the options. Drag stays left-only, so a right-click can never be swallowed by a
+    -- move that the cursor started but did not travel far enough to register.
+    btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     btn:RegisterForDrag("LeftButton")
 
     -- TexCoord inset crops the icon's baked-in border.
@@ -949,6 +1238,23 @@ do
     icon:SetPoint("TOPLEFT", 7, -6)
     icon:SetTexture("Interface\\Icons\\INV_Misc_Bone_HumanSkull_01")
     icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+    -- Tinted red while the master switch is off, so the state reads from the minimap at a glance with
+    -- nothing opened. Desaturated FIRST, and that ordering is the point: SetVertexColor multiplies rather
+    -- than replaces, so tinting the skull's own bone browns directly gives an uneven muddy red, whereas
+    -- tinting a flat grey gives a clean one. Guarded because the call is not on every client's texture.
+    --
+    -- THEME.offRed rather than a colour picked for the minimap, so the switch says "off" in one colour
+    -- everywhere: this icon, the checkbox fill and the HUD title.
+    function RDC.RefreshMinimapTint()
+        local off = RDC.IsEnabled and not RDC.IsEnabled()
+        if icon.SetDesaturated then icon:SetDesaturated(off and true or false) end
+        if off then
+            icon:SetVertexColor(THEME.offRed[1], THEME.offRed[2], THEME.offRed[3])
+        else
+            icon:SetVertexColor(1, 1, 1)   -- back to the texture's own colours, not to a "normal" tint
+        end
+    end
 
     local border = btn:CreateTexture(nil, "OVERLAY")
     border:SetSize(53, 53)
@@ -1004,7 +1310,9 @@ do
         if db then db.angle = angle end
     end)
 
-    btn:SetScript("OnClick", function() RDC.ToggleHUD() end)
+    btn:SetScript("OnClick", function(_, button)
+        if button == "RightButton" then RDC.ToggleOptions() else RDC.ToggleHUD() end
+    end)
 
     btn:SetScript("OnEnter", function(self)
         if dragging then return end
@@ -1012,6 +1320,10 @@ do
         local ver = RDC.GetVersion and RDC.GetVersion() or "?"
         GameTooltip:SetText("Raid Death Count  |cff888888v" .. ver .. "|r", THEME.accent[1], THEME.accent[2], THEME.accent[3])
         GameTooltip:AddLine("Click to toggle the HUD.", 0.8, 0.8, 0.8, true)
+        GameTooltip:AddLine("Right-click for options.", 0.8, 0.8, 0.8, true)
+        if RDC.IsEnabled and not RDC.IsEnabled() then
+            GameTooltip:AddLine("Recording is off.", THEME.offRed[1], THEME.offRed[2], THEME.offRed[3], true)
+        end
         GameTooltip:Show()
     end)
     btn:SetScript("OnLeave", function() GameTooltip:Hide() end)

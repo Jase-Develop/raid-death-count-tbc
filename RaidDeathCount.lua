@@ -361,6 +361,51 @@ function RDC.ToggleDemo()
     if RDC.SetHUDShown then RDC.SetHUDShown(true) elseif RDC.RefreshHUD then RDC.RefreshHUD() end
 end
 
+-- ── Master switch ─────────────────────────────────────────────────────────────
+-- Per character, stored beside the sessions rather than with the account-wide UI prefs. It is not a
+-- preference about this client's furniture, it gates what gets WRITTEN to this character's death data, so
+-- it belongs with that data: the existing split is "counts belong to the raid, storage belongs to the
+-- character", and this is storage. An alt parked in a raid as a bank mule sits the night out while the main
+-- keeps counting.
+--
+-- Applied at four choke points and nowhere else, each one chosen because everything of its kind passes
+-- through it: SendComm (all outbound), OnComm (all inbound), CheckLockout (all housekeeping, including the
+-- two calls UpdateRaidID makes from outside the poll) and the OnUpdate driver (the sweep and the combat
+-- timer). Gating only the sweep would leave a "disabled" client silently merging peers' rows into its saved
+-- variables with the HUD climbing, which is not off by any reading of the word.
+--
+-- Deliberately NOT gated: UpdateRaidID itself, which only tracks WHERE the character is and mints an empty
+-- session, and the report paths, because reading counts already stored is not recording and a report button
+-- that silently did nothing is the exact failure that got "/rdc reset" deleted.
+local function Enabled() return not DB or DB.enabled ~= false end
+RDC.IsEnabled = Enabled
+
+function RDC.SetEnabled(on)
+    on = on and true or false
+    if not DB or DB.enabled == on then return end
+    DB.enabled = on
+
+    -- Both halves mirror what Sweep already does on finding itself outside the raid, because "was switched
+    -- off" and "was not in the raid yet" have to mean the same thing to the poll.
+    --
+    -- Drop the combat clock's anchor, or the entire disabled window is banked as combat time on the first
+    -- tick back, exactly as zoning out mid-fight would (see Sweep's early return).
+    inCombat, lastCombatTick = false, nil
+    -- Force a re-baseline. prevDead still holds the latch state from the instant we switched off, so a
+    -- player who died during the blackout reads as a fresh alive->dead edge and is counted minutes late.
+    -- Worse, whether that phantom appears depends on nothing but whether they happened to still be a corpse
+    -- when the switch flipped. Wiping on both transitions rather than only on enable: it costs nothing while
+    -- Sweep is not running, and it means no path can reach the poll with a stale latch.
+    wipe(prevDead)
+    wasInRaid = false
+
+    print("|cff88bbffRaidDeathCount|r " .. (on
+        and "|cff44ff44on|r: recording and syncing."
+        or  "|cffff4444off|r: nothing recorded, merged or broadcast. Stored counts are kept."))
+    if RDC.RefreshEnabledState then RDC.RefreshEnabledState() end
+    if RDC.RefreshHUD then RDC.RefreshHUD() end
+end
+
 -- ── Comms ─────────────────────────────────────────────────────────────────────
 -- Wire format: "<raidID>|<op>|<payload>". Ops: D = one death (name,class,deaths); ? = resync request;
 -- S = full-state chunk (name,class,deaths;...); H = presence ping (payload = sender version). Messages
@@ -385,6 +430,11 @@ end
 -- Returns true only when a message actually went out. The watchdog needs that: arming an echo probe for a
 -- send that never happened (ungrouped) would time out and report a fake outage.
 local function SendComm(msg)
+    -- The one gate every outbound message passes, which is why the master switch is applied here rather
+    -- than only in the OnUpdate poll: AnnouncePresence and RequestResync are driven by events (login,
+    -- zoning, roster changes), so a poll-only gate would leave a disabled client still introducing itself
+    -- to the raid and asking peers for their state.
+    if not Enabled() then return false end
     -- Syncing only ever makes sense from inside the raid itself. The RaidID is a mapID and nothing else, so
     -- it says WHERE but never WHICH RUN: two clients sticky on the same instance from different nights are
     -- indistinguishable to it. Comms being group scoped was assumed to cover that, on the reasoning that
@@ -722,6 +772,12 @@ end
 local function OnComm(msg, sender)
     local rid, op, payload = msg:match("^(.-)|(.-)|(.*)$")
     if not rid then return end
+    -- Merging an inbound row IS recording, so the master switch has to be enforced on the way in and not
+    -- just on the way out: a send-only gate would leave a client the user believes is off quietly absorbing
+    -- the whole raid's counts into its saved variables, with the HUD climbing to prove it. Ahead of
+    -- NoteInbound for the same reason the raid-instance gate below is: traffic we refuse to process is not
+    -- evidence our channel works.
+    if not Enabled() then return end
     -- The mirror of the send gate, and it has to exist independently rather than trusting peers to stay
     -- quiet: through any staged rollout a peer still on <= 0.7.2 keeps broadcasting from a dungeon, and our
     -- own gate is the only thing that can refuse it. Ahead of NoteInbound deliberately, since traffic from
@@ -861,6 +917,14 @@ end
 -- the same verdict with nothing crossing the wire and nobody holding authority.
 local function CheckLockout(s, iname)
     if not s then return end
+    -- A switched-off addon does no housekeeping either, and the gate belongs HERE rather than on
+    -- CheckActiveLockout, which is only one of three callers: UpdateRaidID reaches this directly from both
+    -- of its branches, and it runs off PLAYER_ENTERING_WORLD and GROUP_ROSTER_UPDATE, neither of which is
+    -- behind the OnUpdate gate. The decay in particular announces itself in chat, and "N deaths cleared"
+    -- arriving from something the user believes is off reads as a bug rather than as maintenance. Nothing is
+    -- lost by deferring: re-enabling picks it up within a heartbeat, and a disabled client answers no
+    -- resyncs, so it cannot serve the counts it skipped clearing to anybody else.
+    if not Enabled() then return end
     local id, resetIn = FindLockout(iname or s.instance)
     local now = time()
 
@@ -918,7 +982,7 @@ end
 -- remembers its own instance name. It has to, because a client logging in outside the raid must zero a
 -- stale session BEFORE it can answer a peer's resync with last week's counts.
 function CheckActiveLockout()   -- assigns the forward-declared local up top, do not make this a new local
-    CheckLockout(ActiveSession(), nil)
+    CheckLockout(ActiveSession(), nil)   -- which is where the master-switch gate lives, covering all callers
 end
 
 -- Re-resolve the active raid; switch (fresh session + resync) only on a genuinely different raid.
@@ -1242,6 +1306,10 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         RaidDeathCountCharDB = RaidDeathCountCharDB or {}
         DB = RaidDeathCountCharDB
         DB.sessions = DB.sessions or {}
+        -- Absent reads as on, so an upgrade never silently stops counting for someone who has never opened
+        -- the options. Written out explicitly rather than left nil, because the saved-variables file is
+        -- read by hand when something goes wrong and "enabled = false" is the first thing to check.
+        if DB.enabled == nil then DB.enabled = true end
         -- Pre-0.3 sessions were account-wide and cannot be attributed to a character, so drop them rather
         -- than hand every alt the main's history. A mid-lockout upgrade re-syncs from peers.
         RaidDeathCountDB.sessions = nil
@@ -1258,6 +1326,9 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         if RequestRaidInfo then RequestRaidInfo() end   -- warms the list, fires UPDATE_INSTANCE_INFO
         if RDC.InitHUD then RDC.InitHUD() end
         if RDC.InitMinimap then RDC.InitMinimap() end
+        -- After InitHUD, which shows the frame: a character logging in switched off has to say so on the
+        -- HUD from the first frame, or it looks like an addon that has simply stopped working.
+        if RDC.RefreshEnabledState then RDC.RefreshEnabledState() end
         RequestResync()
         AnnouncePresence()
         print(("|cff88bbffRaid Death Count|r v%s loaded. Enjoy!"):format(RDC.GetVersion()))
@@ -1302,6 +1373,10 @@ end)
 local acc = 0
 frame:SetScript("OnUpdate", function(_, elapsed)
     DrainChat()   -- ahead of the gate on purpose: behind it the queue drains no faster than POLL_INTERVAL
+    -- Below DrainChat and above everything else. Switching off mid-report must not strand the lines already
+    -- queued, since they are a report the user asked for and the queue has no other drain; past this point
+    -- nothing that records, syncs or times the raid may run.
+    if not Enabled() then return end
     acc = acc + elapsed
     if acc < POLL_INTERVAL then return end
     acc = 0
@@ -1499,6 +1574,8 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
         if RDC.ToggleLock then RDC.ToggleLock() end
     elseif cmd == "stats" then
         if RDC.ToggleStats then RDC.ToggleStats() end
+    elseif cmd == "options" or cmd == "config" then
+        if RDC.ToggleOptions then RDC.ToggleOptions() end
     elseif cmd == "minimap" then
         if RDC.ToggleMinimap then RDC.ToggleMinimap() end
     elseif cmd == "demo" then
@@ -1512,6 +1589,7 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
         print("  /rdc                toggle the HUD")
         print("  /rdc report [<name>|top3|top5|least|stats|class|all]   report to chat")
         print("  /rdc channel [raid|party|guild]   where reports are sent")
+        print("  /rdc options        settings (or right-click the minimap button)")
         print("  /rdc lock           lock/unlock HUD move + resize")
         print("  /rdc stats          show/hide the stats bar under the HUD")
         print("  /rdc minimap        show/hide the minimap button")

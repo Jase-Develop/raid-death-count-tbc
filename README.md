@@ -47,9 +47,10 @@ deaths. No dependencies, no setup, no configuration to get wrong.
 | `/rdc report` | Post counts to raid chat, or wherever `/rdc channel` points. Add `top3`, `top5`, `least`, `stats` or `class` to narrow it. |
 | `/rdc report <name>` | Post one player's count. Ctrl+clicking their row in the HUD does the same thing. |
 | `/rdc channel [raid\|party\|guild]` | Choose where reports are posted, or print the current choice. The dropdown in the reports panel does the same thing. |
+| `/rdc options` | Open the options window. Right-clicking the minimap button does the same thing. |
 | `/rdc lock` | Lock or unlock moving and resizing. |
 | `/rdc stats` | Show or hide the stats bar under the HUD. The **S** header button does the same thing. |
-| `/rdc minimap` | Show or hide the minimap button. |
+| `/rdc minimap` | Show or hide the minimap button. The options window has the same toggle. |
 | `/rdc demo` | Fill the HUD with sample data for a look around. Never touches real counts. |
 | `/rdc version` | Print the version. |
 
