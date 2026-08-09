@@ -9,6 +9,13 @@ local COMM_PREFIX   = "RDC1"               -- addon-message prefix (format versi
 local POLL_INTERVAL = 0.5                  -- seconds between death sweeps
 local SYNC_THROTTLE = 5                    -- min seconds between our resync replies
 local MSG_MAX       = 230                  -- soft cap on an addon-message body before we flush a chunk
+local COMM_INTERVAL = 0.2                  -- min seconds between our own outbound addon messages. Batching
+                                           -- already killed the per-death fan-out, but a chunked S still
+                                           -- leaves the client in one frame; this paces what is left.
+local REPLY_JITTER  = 2                    -- max seconds a full-state reply is held back. "?" is a
+                                           -- BROADCAST and every client answers it, so the burst that
+                                           -- actually threatens the channel is N clients replying on the
+                                           -- same frame, which no per-client queue can pace. See ReplyDelay.
 local PEER_STALE    = 90                   -- seconds before a silent peer drops out of the sync count
 local HEARTBEAT     = 30                   -- seconds between our presence pings (op H)
 local PROBE_TIMEOUT = 10                   -- seconds to wait for our own H to echo back before calling
@@ -60,6 +67,11 @@ local deathLog   = false      -- diagnostic printing of every death edge and eve
 -- message cost. GetTime() (monotonic, sub-second) for the same reason the watchdog uses it.
 local inCombat        = false -- was the raid in combat as of the last sweep
 local lastCombatTick          -- GetTime() at the last accumulation (nil = nothing banked yet)
+
+-- Outbound comm queue. Declared up here rather than beside its functions (where chatQueue sits) because
+-- SetEnabled has to be able to discard it, and that runs well above the comms block.
+local commQueue = {}          -- pending outbound messages, each { msg, probe, after }
+local commNextAt = 0          -- GetTime() before which the next message must not go out
 
 -- Comms watchdog. Durations use GetTime() (monotonic, sub-second); anything shown to a human uses time().
 local commsProbeSent          -- GetTime() of the H we are waiting to hear echo back (nil = not waiting)
@@ -398,6 +410,12 @@ function RDC.SetEnabled(on)
     -- Sweep is not running, and it means no path can reach the poll with a stale latch.
     wipe(prevDead)
     wasInRaid = false
+    -- Discard anything still waiting to go out. The opposite of what the chat queue wants: a queued REPORT
+    -- is something the user asked for and must still be delivered, whereas a queued sync message from a
+    -- client the user has just switched off is exactly what the switch exists to stop. Without this the
+    -- drain sits below the switch and the messages would either strand forever or leave on re-enable,
+    -- carrying a digest and counts from whenever they were built.
+    wipe(commQueue)
 
     print("|cff88bbffRaidDeathCount|r " .. (on
         and "|cff44ff44on|r: recording and syncing."
@@ -427,13 +445,16 @@ local function EnsurePrefix()
     if commsOK == false then reassertCount = reassertCount + 1 end
 end
 
--- Returns true only when a message actually went out. The watchdog needs that: arming an echo probe for a
--- send that never happened (ungrouped) would time out and report a fake outage.
-local function SendComm(msg)
-    -- The one gate every outbound message passes, which is why the master switch is applied here rather
-    -- than only in the OnUpdate poll: AnnouncePresence and RequestResync are driven by events (login,
-    -- zoning, roster changes), so a poll-only gate would leave a disabled client still introducing itself
-    -- to the raid and asking peers for their state.
+-- The three gates every outbound message passes. Returns the channel to send on, or false.
+--
+-- Called at QUEUE time and again at DRAIN time, which is not belt and braces: the queue opened a gap
+-- between deciding to send and sending, and a message that was legitimate when queued must not go out
+-- after we have zoned out of the instance or the user has switched the addon off. Re-checking here is what
+-- makes the queue unable to widen any of the three.
+local function CanSend()
+    -- The master switch is applied to comms here rather than only in the OnUpdate poll because
+    -- AnnouncePresence and RequestResync are driven by events (login, zoning, roster changes), so a
+    -- poll-only gate would leave a disabled client still introducing itself and asking peers for state.
     if not Enabled() then return false end
     -- Syncing only ever makes sense from inside the raid itself. The RaidID is a mapID and nothing else, so
     -- it says WHERE but never WHICH RUN: two clients sticky on the same instance from different nights are
@@ -443,7 +464,16 @@ local function SendComm(msg)
     -- once. Physically standing in the instance is the one condition stickiness cannot fake, so gate on it.
     -- Subsumes the old battleground and arena suppression, neither of which is a raid either.
     if not InRaidInstance() then return false end
-    local ch = GroupChannel()
+    return GroupChannel()
+end
+
+-- isProbe arms the watchdog HERE and not at the call site, and that move is required by the queue rather
+-- than being tidier: arming when we DECIDE to send starts the PROBE_TIMEOUT clock before the message
+-- exists on the wire, and a heartbeat the drain then refuses (we zoned out while it waited) could never
+-- echo and would time out into a FALSE outage. A false outage is the one thing the indicator must never
+-- produce, which is why PROBE_TIMEOUT is already generous.
+local function PushComm(msg, isProbe)
+    local ch = CanSend()
     if not ch then return false end
     if C_ChatInfo and C_ChatInfo.SendAddonMessage then
         C_ChatInfo.SendAddonMessage(COMM_PREFIX, msg, ch)
@@ -452,7 +482,69 @@ local function SendComm(msg)
     else
         return false
     end
+    -- Only when nothing is already in flight, so the timeout is measured from the OLDEST unanswered send
+    -- rather than being pushed forward by every later one.
+    if isProbe and not commsProbeSent then commsProbeSent = GetTime() end
     return true
+end
+
+-- Paces our own outbound messages. Same shape as QueueChat below and for the same reason, one layer down:
+-- an idle queue sends immediately, so the overwhelmingly common case (a lone death, a heartbeat) puts
+-- exactly the same bytes on the wire at exactly the same moment it always has, and only a burst is spread.
+--
+-- THE MESSAGE IS QUEUED FULLY FORMED, with the RaidID already baked into the string by the caller. Queueing
+-- the parts and building the string at drain time is the one way this file could corrupt counts: zoning
+-- between queue and drain would stamp one raid's rows with another raid's id, peers there would see a
+-- matching rid, and merge by MAX would make it permanent. QueueChat captures its channel at queue time
+-- against the same class of mistake.
+--
+-- Returns whether the message was ACCEPTED, not whether it was sent, which is the one semantic the split
+-- above changes. Nothing consults it any more except SendEntries, which only reports whether there was
+-- anything to send at all.
+--
+-- The queue is strictly FIFO, so a delayed message at the head holds up everything behind it: a death found
+-- while a jittered full-state reply is still waiting can be up to REPLY_JITTER late. Accepted rather than
+-- worked around with a priority queue, because merge is by MAX and a late death converges identically to a
+-- prompt one. Reordering to let deaths overtake would buy nothing and cost the FIFO property that makes
+-- this easy to reason about.
+local function SendComm(msg, delay, isProbe)
+    if not CanSend() then return false end
+    local now = GetTime()
+    if #commQueue == 0 and not delay and now >= commNextAt then
+        commNextAt = now + COMM_INTERVAL
+        return PushComm(msg, isProbe)
+    end
+    commQueue[#commQueue + 1] = { msg = msg, probe = isProbe, after = delay and (now + delay) or 0 }
+    return true
+end
+
+-- Driven from the OnUpdate below, which must call this ahead of its POLL_INTERVAL gate: behind it the
+-- queue could only drain every 0.5s and COMM_INTERVAL would mean nothing.
+local function DrainComm()
+    local m = commQueue[1]
+    if not m then return end
+    local now = GetTime()
+    if now < commNextAt or now < m.after then return end
+    -- Measured from the actual send, not the scheduled one, so a frame hitch stretches the gap rather than
+    -- banking credit and firing a burst to catch up, which is the thing being prevented.
+    commNextAt = now + COMM_INTERVAL
+    table.remove(commQueue, 1)
+    -- Return deliberately ignored: a message CanSend now refuses is dropped rather than retried. Merge is
+    -- by MAX and the heartbeat digest catches a peer up within ~60s, so a dropped send costs latency and
+    -- never a count.
+    PushComm(m.msg, m.probe)
+end
+
+-- How long to hold back our reply to a "?", so twenty clients answering one broadcast do not land on the
+-- same frame. Derived from our own NAME rather than from math.random, and that is not paranoia: Lua 5.1
+-- starts from a FIXED seed unless something calls math.randomseed, so every client could draw the identical
+-- "random" delay and stack up exactly as before, with the spread silently doing nothing. A name hash is
+-- different per client by construction and needs no seeding, no shared clock and no agreement.
+local function ReplyDelay()
+    local n = playerName or UnitName("player") or ""
+    local h = 0
+    for i = 1, #n do h = (h + n:byte(i) * i) % 97 end
+    return (h / 97) * REPLY_JITTER
 end
 
 local function Entry(name, class, deaths)
@@ -462,7 +554,10 @@ end
 -- Sends a list of "name,class,deaths;" entries as op S, split into <=MSG_MAX chunks since an addon message
 -- caps around 255 bytes. Shared by the full-state reply and the sweep batch, which put the same rows on the
 -- wire and must chunk them the same way.
-local function SendEntries(entries)
+-- delay holds every chunk back by the same amount, passed only by the full-state reply. A sweep batch
+-- passes nothing: those are deaths as they happen and there is no fan-in to spread, since the sweep that
+-- produced them ran on one client.
+local function SendEntries(entries, delay)
     local prefix = DB.currentRaidID .. "|S|"
     local buf, sent = "", false
     for i = 1, #entries do
@@ -470,11 +565,11 @@ local function SendEntries(entries)
         -- The buf check matters for a single oversize entry: without it we would flush an empty payload
         -- first and waste a message.
         if buf ~= "" and #prefix + #buf + #e > MSG_MAX then
-            SendComm(prefix .. buf); buf = ""; sent = true
+            SendComm(prefix .. buf, delay); buf = ""; sent = true
         end
         buf = buf .. e
     end
-    if buf ~= "" then SendComm(prefix .. buf); sent = true end
+    if buf ~= "" then SendComm(prefix .. buf, delay); sent = true end
     return sent
 end
 
@@ -542,11 +637,10 @@ local function AnnouncePresence()
     -- available", which is CORRECT: only a client newer than 0.5 sends a digest at all. The one cost is
     -- that its peer tooltip shows the raw field, cosmetic and only until it updates.
     local body = RDC.GetVersion() .. "," .. StateDigest()
-    -- Doubles as the watchdog's echo probe. Only arm when nothing is already in flight, so the timeout is
-    -- measured from the OLDEST unanswered send rather than being pushed forward by every later one.
-    if SendComm(DB.currentRaidID .. "|H|" .. body) and not commsProbeSent then
-        commsProbeSent = GetTime()
-    end
+    -- Doubles as the watchdog's echo probe, which PushComm arms at the moment this actually reaches the
+    -- server rather than here. Not jittered: heartbeats are already spread, each client's running off its
+    -- own login time rather than off a shared trigger the way a "?" reply is.
+    SendComm(DB.currentRaidID .. "|H|" .. body, nil, true)
 end
 
 local function IsSelf(sender)
@@ -765,7 +859,11 @@ local function SendFullState()
     for name, p in pairs(s.players) do
         if (p.deaths or 0) > 0 then entries[#entries + 1] = Entry(name, p.class, p.deaths) end
     end
-    return SendEntries(entries)
+    -- Held back by our own offset. SYNC_THROTTLE bounds how often ONE client replies and does nothing about
+    -- all of them replying at once, which is the shape of the burst that actually matters here: every
+    -- client's timer starts from the same inbound "?". Costs a latecomer up to REPLY_JITTER before their
+    -- counts fill in, which merge by MAX makes free.
+    return SendEntries(entries, ReplyDelay())
 end
 
 -- Anything for a raid other than our current one is dropped.
@@ -1377,6 +1475,11 @@ frame:SetScript("OnUpdate", function(_, elapsed)
     -- queued, since they are a report the user asked for and the queue has no other drain; past this point
     -- nothing that records, syncs or times the raid may run.
     if not Enabled() then return end
+    -- Below the switch where DrainChat is above it, which is the whole difference between the two queues:
+    -- a report is owed to the user and must survive being switched off, a sync message must not outlive it.
+    -- SetEnabled empties the queue on the way out, so nothing strands here. Above the POLL_INTERVAL gate
+    -- for the same reason DrainChat is: behind it COMM_INTERVAL could never be shorter than 0.5s.
+    DrainComm()
     acc = acc + elapsed
     if acc < POLL_INTERVAL then return end
     acc = 0
@@ -1499,9 +1602,12 @@ function RDC.DebugComms()
     end
     -- Parenthesised: GetLostPeers returns two values and this is the last argument, so without them the
     -- second would spill into the format call.
-    print(("|cff88bbffRDC|r comms: %s   echo %s (worst %.1fs)   peers %s   live=%d lost=%d"):format(
+    -- queued is the only window onto the send queue, which is otherwise invisible: a figure that is anything
+    -- but 0 outside the instant of a burst means the drain has stalled, and the drain is what every outbound
+    -- message now depends on.
+    print(("|cff88bbffRDC|r comms: %s   echo %s (worst %.1fs)   peers %s   live=%d lost=%d queued=%d"):format(
         state, RDC.Ago(h.lastLoopback), h.maxEcho, RDC.Ago(h.lastPeerRx),
-        LivePeerCount(), (RDC.GetLostPeers())))
+        LivePeerCount(), (RDC.GetLostPeers()), #commQueue))
     -- Our digest against every peer's. Same number everywhere means the raid genuinely agrees; a peer stuck
     -- on a different one is the desync, visible here without waiting for the automatic resync to fire.
     local mine, agree, differ = StateDigest(), {}, {}
