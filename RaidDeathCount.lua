@@ -56,10 +56,6 @@ local lastResyncAsk = 0       -- time() of the last resync request we KNOW ABOUT
                               -- counts because "?" is a broadcast: their replies heal us too, so a second
                               -- request adds traffic and nothing else (see DIGEST_COOLDOWN).
 local wasInRaid  = false      -- were we inside the raid instance last sweep (re-baseline on re-entry)
-local deathLog   = false      -- diagnostic printing of every death edge and every remote raise, toggled by
-                              -- RDC.DebugDeaths(). Exists to separate a genuine death from a
-                              -- UnitIsDeadOrGhost flicker: merge by MAX spreads one client's miscount to the
-                              -- entire raid, so the only useful question is which client produced the number.
 
 -- Combat timer. Measures seconds the RAID spent fighting, not wall clock, which is what makes it survive a
 -- multi-night lockout with no gap rule: the hours between Tuesday and Thursday simply are not counted.
@@ -119,31 +115,6 @@ local function RebuildWatched()
     else
         watched[#watched + 1] = "player"
     end
-end
-
--- Death-edge diagnostics. Both read their own API values inside the guard so nothing is evaluated while
--- logging is off, which matters because a wipe hits these 25 times in one tick.
---
--- The decisive reading is the PAIR of lines, not the death on its own: a real death is a single DEATH, while
--- a flicker in UnitIsDeadOrGhost is DEATH / alive / DEATH a tick or two apart. conn and vis separate the two
--- causes of an alive edge, a resurrection from the unit's data merely going unavailable.
-local function LogDeathEdge(kind, name, unit, total, own)
-    if not deathLog then return end
-    print(("|cff88bbffRDC|r |cffaaaaaa%s.%d|r %s %s (%s)%s dead=%s ghost=%s conn=%s vis=%s"):format(
-        date("%H:%M:%S"), math.floor(GetTime() * 10) % 10, kind, name, unit,
-        -- own alongside the merged total is the readout that verifies the split: our own sightings should
-        -- track the real death count even while the total carries a peer's higher number.
-        total and (" -> " .. total .. " (own " .. tostring(own) .. ")") or "",
-        tostring(UnitIsDead(unit)), tostring(UnitIsGhost(unit)),
-        tostring(UnitIsConnected(unit)), tostring(UnitIsVisible(unit))))
-end
-
--- Logged only when the merge actually RAISED our count, since that is the one case that changes what the HUD
--- shows. Names the sender, which is what localises a miscount to a client without instrumenting every install.
-local function LogRemoteRaise(op, name, deaths, sender)
-    if not deathLog then return end
-    print(("|cff88bbffRDC|r |cffaaaaaa%s.%d|r remote %s %s -> %s from %s"):format(
-        date("%H:%M:%S"), math.floor(GetTime() * 10) % 10, op, name, tostring(deaths), tostring(sender)))
 end
 
 -- ── RaidID (sync scope) ───────────────────────────────────────────────────────
@@ -250,9 +221,8 @@ local function RecordDeath(name, class)
     -- silently swallow real deaths until we climbed back past it.
     p.own = (p.own or p.deaths) + 1
     if p.own > p.deaths then p.deaths = p.own end
-    -- class is the STORED one, which may be from an earlier sighting when this read is nil. own is returned
-    -- for the diagnostic log only.
-    return p.deaths, p.class, p.own
+    -- class is the STORED one, which may be from an earlier sighting when this read is nil.
+    return p.deaths, p.class
 end
 
 -- Merge by MAX. Counts only rise within a raid, so every client converges without dedup, ordering or
@@ -887,14 +857,12 @@ local function OnComm(msg, sender)
     if op == "D" then
         local name, class, deaths = payload:match("^(.-),(.-),(%d+)$")
         if name and ApplyRemote(name, class, tonumber(deaths)) then
-            LogRemoteRaise("D", name, deaths, sender)
             RefreshHUD()
         end
     elseif op == "S" then
         local changed = false
         for name, class, deaths in payload:gmatch("([^,;]+),([^,;]*),(%d+);?") do
             if ApplyRemote(name, class, tonumber(deaths)) then
-                LogRemoteRaise("S", name, deaths, sender)
                 changed = true
             end
         end
@@ -939,11 +907,9 @@ local function Sweep()
                 prevDead[name] = dead            -- first sight: baseline only, we did not witness it
             elseif dead and not was then
                 prevDead[name] = true
-                local total, cls, own = RecordDeath(name, select(2, UnitClass(unit)))
+                local total, cls = RecordDeath(name, select(2, UnitClass(unit)))
                 if total then batch[#batch + 1] = Entry(name, cls, total) end
-                LogDeathEdge("DEATH", name, unit, total, own)
             elseif not dead then
-                if was then LogDeathEdge("alive", name, unit, nil) end
                 prevDead[name] = false
             end
         end
@@ -1568,15 +1534,6 @@ function RDC.DebugTimer()
     print(("|cff88bbffRDC|r combat timer: %.1fs (%dm %02ds)  inCombat=%s  inRaidInstance=%s%s"):format(
         cs, math.floor(cs / 60), math.floor(cs % 60), tostring(inCombat), tostring(InRaidInstance()),
         RDC.demoData and "  (DEMO: hud shows " .. RDC.FormatClock(DEMO_COMBAT_SECONDS) .. ")" or ""))
-end
-
--- In memory only, so it is off again after a /reload. Deliberate: this prints on every death of every fight,
--- which is not something to leave running by accident for a whole raid night.
-function RDC.DebugDeaths()
-    deathLog = not deathLog
-    print("|cff88bbffRDC|r death edge logging " .. (deathLog and "|cff44ff44ON|r" or "|cffff4444OFF|r")
-        .. " (off again after /reload)")
-    return deathLog
 end
 
 function RDC.DebugComms()
