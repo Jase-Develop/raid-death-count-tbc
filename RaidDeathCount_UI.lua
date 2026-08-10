@@ -1086,6 +1086,90 @@ optGrip:SetScript("OnMouseUp", function()
     if db then db.width, db.height = options:GetWidth(), options:GetHeight() end
 end)
 
+-- ── Side menu and content pages ───────────────────────────────────────────────
+-- The body is a fixed-width left nav column plus a content pane of swappable pages, one shown at a time.
+-- This is WarlockQol's options layout rebuilt on this file's own flat helpers, taken wholesale rather than
+-- invented: the two addons' windows are meant to read as a pair, and a list down the side is the one layout
+-- that grows without disturbing what is already there, since a new feature costs one nav entry and one page
+-- and nothing above it moves. That is exactly the property the title bar does NOT have, which is what put
+-- the two global toggles up there and left this space free to begin with.
+local OPT_SIDEBAR_W = 150   -- fixed, so the content pane takes every pixel the window gains on resize
+local OPT_NAV_H     = 24
+local OPT_BODY_FS   = 12
+local OPT_HOME_PAGE = "general"
+
+local optSidebar = CreateFrame("Frame", nil, options, "BackdropTemplate")
+optSidebar:SetPoint("TOPLEFT",    optHeader, "BOTTOMLEFT", 0,   -PAD)
+optSidebar:SetPoint("BOTTOMLEFT", options,   "BOTTOMLEFT", PAD,  PAD)
+optSidebar:SetWidth(OPT_SIDEBAR_W)
+ApplyFlat(optSidebar, THEME.panel, true)
+
+-- No backdrop and, more importantly, no mouse. The resize grip sits at the window's bottom-right underneath
+-- this frame, so a content pane that swallowed clicks would leave the window unresizable from its own corner.
+local optContent = CreateFrame("Frame", nil, options)
+optContent:SetPoint("TOPLEFT",     optSidebar, "TOPRIGHT",     PAD, 0)
+optContent:SetPoint("BOTTOMRIGHT", options,    "BOTTOMRIGHT", -PAD, PAD)
+
+-- ONE shared page header (title, subtitle, rule) rather than one per page, so a page lays out only its own
+-- body and no two pages can drift apart. Chained by anchoring rather than by fixed offsets: the rule hangs
+-- off the subtitle and the page body off the rule, so a subtitle that wraps to two lines pushes both down
+-- and a page with no subtitle collapses the rule up under the title for free.
+local optPageTitle = optContent:CreateFontString(nil, "OVERLAY")
+ApplyFont(optPageTitle, OPT_BRAND_FS)
+optPageTitle:SetPoint("TOPLEFT", optContent, "TOPLEFT", 4, -6)
+optPageTitle:SetTextColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
+
+-- Left inset matches the title's so the two line up flush; both horizontal anchors, so it wraps.
+local optPageSub = optContent:CreateFontString(nil, "OVERLAY")
+ApplyFont(optPageSub, OPT_LABEL_FS)
+optPageSub:SetPoint("TOPLEFT",  optContent, "TOPLEFT",   4, -28)
+optPageSub:SetPoint("TOPRIGHT", optContent, "TOPRIGHT", -8, -28)
+optPageSub:SetJustifyH("LEFT")
+optPageSub:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+
+local optPageRule = optContent:CreateTexture(nil, "ARTWORK")
+optPageRule:SetColorTexture(THEME.border[1], THEME.border[2], THEME.border[3], 1)
+optPageRule:SetPoint("TOPLEFT",  optPageSub, "BOTTOMLEFT",  -4, -6)
+optPageRule:SetPoint("TOPRIGHT", optPageSub, "BOTTOMRIGHT",  8, -6)
+optPageRule:SetHeight(1)
+
+local optPages     = {}   -- page name -> frame
+local optTitles    = {}   -- page name -> header title
+local optSubs      = {}   -- page name -> subtitle under the title (or nil)
+local optCurrent           -- name of the page currently shown
+local UpdateOptNav         -- forward decl: the nav is built below the pages, but ShowOptPage highlights it
+
+-- Called with no argument by RefreshOptions, which is why the fallback chain is here rather than at the
+-- call site: re-opening the window returns to the page last viewed this session, and only a first open
+-- lands on the home page. Nothing about that is persisted, deliberately, since which page you were last
+-- reading is not a preference worth carrying across a reload.
+local function ShowOptPage(name)
+    name = name or optCurrent or OPT_HOME_PAGE
+    for n, p in pairs(optPages) do
+        if n == name then p:Show() else p:Hide() end
+    end
+    optCurrent = name
+    optPageTitle:SetText(optTitles[name] or "Raid Death Count")
+    optPageSub:SetText(optSubs[name] or "")   -- setting the text is enough, the rule and body reflow
+    if UpdateOptNav then UpdateOptNav(name) end
+    local p = optPages[name]
+    if p and p.OnPageShow then p.OnPageShow() end
+end
+
+-- A page is a child of the content pane filling everything below the shared rule, hidden until selected.
+-- No mouse, for the grip's sake (see optContent). OnPageShow can be set by the caller afterwards, for a
+-- page whose widgets have to re-read state that may have changed while the window was shut.
+local function NewOptPage(name, titleText, subtitle)
+    local p = CreateFrame("Frame", nil, optContent)
+    p:SetPoint("TOPLEFT",     optPageRule, "BOTTOMLEFT",   0, -8)
+    p:SetPoint("BOTTOMRIGHT", optContent,  "BOTTOMRIGHT",  0,  0)
+    p:Hide()
+    optPages[name]  = p
+    optTitles[name] = titleText
+    optSubs[name]   = subtitle
+    return p
+end
+
 -- ── Title-bar toggles ─────────────────────────────────────────────────────────
 -- The global switches live in the title bar, centred as one group, the way WarlockQol carries its master
 -- and minimap pair. They belong there rather than in the body because they are the two that apply to the
@@ -1157,6 +1241,7 @@ local function RefreshOptions()
     optTitle:SetText(("Raid Death Count  |cff888888v%s|r")
         :format(RDC.GetVersion and RDC.GetVersion() or "?"))
     for _, t in ipairs(optToggles) do t.cb:SetChecked(t.get()) end
+    ShowOptPage()   -- no argument: the page last viewed, or the home page on a first open
 end
 options:SetScript("OnShow", RefreshOptions)
 
@@ -1175,6 +1260,109 @@ AddToggle("Minimap Icon",
     "Show the Raid Death Count button on the minimap. Reachable again with /rdc options if you hide it.",
     function() return not (RDC.IsMinimapHidden and RDC.IsMinimapHidden()) end,
     function(on) if RDC.SetMinimapHidden then RDC.SetMinimapHidden(not on) end end)
+
+-- ── General page ──────────────────────────────────────────────────────────────
+-- The landing page, and for now the only one. Deliberately a plain read: what the addon does, what the HUD
+-- shows, and the two behaviours a new user would otherwise be surprised by (it only counts inside a raid
+-- instance, and it resets itself). No settings live here, which is why it can be one FontString.
+--
+-- The accent colour is written as an inline |cff| code rather than set on the FontString, because only part
+-- of the run is highlighted and SetTextColor would take the lot. It is THEME.accent in hex, so a re-theme
+-- has to touch both, which is the cost of highlighting inside a paragraph.
+do
+    local general = NewOptPage(OPT_HOME_PAGE, "General",
+        "What this addon does, and how it behaves while you raid.")
+
+    -- Both horizontal anchors so the paragraph wraps to the pane, which is the whole reason it reflows when
+    -- the window is resized rather than needing a layout pass.
+    local body = general:CreateFontString(nil, "OVERLAY")
+    ApplyFont(body, OPT_BODY_FS)
+    body:SetPoint("TOPLEFT",  general, "TOPLEFT",   6, -6)
+    body:SetPoint("TOPRIGHT", general, "TOPRIGHT", -8, -6)
+    body:SetJustifyH("LEFT")
+    body:SetSpacing(4)
+    body:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+    body:SetText(
+        "|cff66baffWelcome to Raid Death Count.|r\n\n" ..
+        "It counts how many times each player in your raid dies, and keeps that count in step with " ..
+        "everyone else in the raid who is running the addon.\n\n" ..
+        "The HUD lists one player per row, class icon, name and deaths, sorted by deaths descending. " ..
+        "Drag its title bar to move it, the bottom-right corner to resize it, and use the |cff66baffR|r " ..
+        "button to post a summary to chat. Ctrl+click a row to report just that player.\n\n" ..
+        "Counts are shared automatically and there is nothing to start or stop. Every client keeps the " ..
+        "highest number it has seen for each player, so joining late, disconnecting or reloading all catch " ..
+        "up on their own.\n\n" ..
+        "Two things worth knowing. Deaths are only counted while you are physically inside a raid " ..
+        "instance, so nothing you do in a dungeon, a battleground or the world is recorded. And counts " ..
+        "clear themselves when the raid's weekly lockout resets, so a new week always starts at zero.\n\n" ..
+        "|cff66baffOpen this window any time with /rdc options, or by right-clicking the minimap icon.|r")
+end
+
+-- ── Side menu items ───────────────────────────────────────────────────────────
+-- Built after the pages so every entry has something to show. One flat button per page, stacked from the
+-- sidebar's top: accent fill and dark text when selected, transparent with a faint accent wash on hover
+-- otherwise, which is WarlockQol's nav treatment. Adding a page means adding a line to OPT_NAV_ITEMS and
+-- nothing else, which is the property the whole layout was chosen for.
+--
+-- Hand-rolled rather than MakeFlatButton for the same reason WarlockQol's is: a nav item needs a persistent
+-- SELECTED state layered under a hover state, and MakeFlatButton's tint/active pair is built for the report
+-- panel's single row of buttons, where selection recolours a border instead of filling the whole row.
+do
+    local OPT_NAV_ITEMS = {
+        { label = "General", page = OPT_HOME_PAGE },
+    }
+    local navButtons = {}
+    local y = 4   -- running distance from the sidebar's top edge, so items can differ in height later
+
+    for _, item in ipairs(OPT_NAV_ITEMS) do
+        local b = CreateFrame("Button", nil, optSidebar)
+        b:SetHeight(OPT_NAV_H)
+        b:SetPoint("TOPLEFT",  optSidebar, "TOPLEFT",   4, -y)
+        b:SetPoint("TOPRIGHT", optSidebar, "TOPRIGHT", -4, -y)
+
+        -- Selection fill, hidden unless this item is the current page. BACKGROUND so the label draws over it.
+        local sel = b:CreateTexture(nil, "BACKGROUND")
+        sel:SetAllPoints()
+        sel:SetColorTexture(THEME.accent[1], THEME.accent[2], THEME.accent[3], 1)
+        sel:Hide()
+        b.sel = sel
+
+        -- HIGHLIGHT layer, so the client shows and hides it on hover with no OnEnter/OnLeave of our own.
+        local hov = b:CreateTexture(nil, "HIGHLIGHT")
+        hov:SetAllPoints()
+        hov:SetColorTexture(THEME.accent[1], THEME.accent[2], THEME.accent[3], 0.12)
+
+        local fs = b:CreateFontString(nil, "OVERLAY")
+        ApplyFont(fs, OPT_BODY_FS)
+        fs:SetPoint("LEFT",  b, "LEFT",   8, 0)
+        fs:SetPoint("RIGHT", b, "RIGHT", -4, 0)
+        fs:SetJustifyH("LEFT")
+        fs:SetWordWrap(false)   -- a long label is clipped rather than silently becoming a two-line item
+        fs:SetText(item.label)
+        b.label = fs
+
+        b.page = item.page
+        b:SetScript("OnClick", function() ShowOptPage(item.page) end)
+        navButtons[#navButtons + 1] = b
+
+        y = y + OPT_NAV_H + 1
+    end
+
+    -- Dark text on the accent fill when selected, normal body text otherwise. Assigned to the forward
+    -- declaration above, so ShowOptPage repaints the column on every switch and the highlight cannot be
+    -- left on two items.
+    UpdateOptNav = function(name)
+        for _, b in ipairs(navButtons) do
+            if b.page == name then
+                b.sel:Show()
+                b.label:SetTextColor(THEME.bg[1], THEME.bg[2], THEME.bg[3])
+            else
+                b.sel:Hide()
+                b.label:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+            end
+        end
+    end
+end
 
 function RDC.ToggleOptions()
     if options:IsShown() then options:Hide() else options:Show() end
