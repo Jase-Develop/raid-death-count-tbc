@@ -245,28 +245,41 @@ end
 
 -- ── Snapshot (for HUD + reports) ──────────────────────────────────────────────
 
--- Sorted by deaths desc, then name asc. Mirrors RDC.demoData instead of the session when demo mode is on.
-function RDC.GetSnapshot()
-    local out = {}
-    if RDC.demoData then
-        for _, e in ipairs(RDC.demoData) do
-            out[#out + 1] = { name = e.name, class = e.class, deaths = e.deaths }
-        end
-    else
-        local s = ActiveSession()
-        if s then
-            for name, p in pairs(s.players) do
-                if (p.deaths or 0) > 0 then
-                    out[#out + 1] = { name = name, class = p.class, deaths = p.deaths }
-                end
-            end
-        end
-    end
+-- Deaths desc, then name asc. The name tiebreak's real job is STABILITY: a player moves only when their own
+-- count changes, never because somebody else's did, which neither insertion nor pairs() order would give.
+local function SortRows(out)
     table.sort(out, function(a, b)
         if a.deaths ~= b.deaths then return a.deaths > b.deaths end
         return a.name < b.name
     end)
     return out
+end
+
+-- The one row builder over a session's players, shared by the HUD's active session and by the Lockouts
+-- page's stored ones, so a browsed raid cannot render by different rules than the raid you are standing in.
+-- Zero-count rows are dropped here rather than by the caller: we may hold one for a player nobody has seen
+-- die, and StateDigest skips them for the same reason.
+local function SnapshotOf(players)
+    local out = {}
+    for name, p in pairs(players or {}) do
+        if (p.deaths or 0) > 0 then
+            out[#out + 1] = { name = name, class = p.class, deaths = p.deaths }
+        end
+    end
+    return SortRows(out)
+end
+
+-- Sorted by deaths desc, then name asc. Mirrors RDC.demoData instead of the session when demo mode is on.
+function RDC.GetSnapshot()
+    if RDC.demoData then
+        local out = {}
+        for _, e in ipairs(RDC.demoData) do
+            out[#out + 1] = { name = e.name, class = e.class, deaths = e.deaths }
+        end
+        return SortRows(out)   -- demo rows are authored, so they skip the zero filter and only need sorting
+    end
+    local s = ActiveSession()
+    return SnapshotOf(s and s.players)
 end
 
 -- Summed from a snapshot rather than kept as a running counter, so it can never drift from the rows the
@@ -310,6 +323,19 @@ function RDC.FormatDPM(deaths, sec)
     return ("%.2f"):format((deaths or 0) * 60 / sec)
 end
 
+-- A coarse two-part span: "2d 4h", "4h 12m", "12m". Beside the other two formatters and for the same
+-- reason, so nothing the addon prints can disagree about rounding. RDC.Ago cannot serve this: it stops at
+-- minutes, and a lockout runs to days.
+function RDC.FormatDuration(sec)
+    sec = math.max(0, math.floor(sec or 0))
+    local d = math.floor(sec / 86400)
+    local h = math.floor(sec / 3600) % 24
+    local m = math.floor(sec / 60) % 60
+    if d > 0 then return ("%dd %dh"):format(d, h) end
+    if h > 0 then return ("%dh %dm"):format(h, m) end
+    return ("%dm"):format(m)
+end
+
 function RDC.GetInstanceName()
     if RDC.demoData then return "Demo Preview" end
     local s = ActiveSession()
@@ -322,6 +348,82 @@ function RDC.GetMapID()
     if RDC.demoData then return nil end
     local s = ActiveSession()
     return s and s.mapID
+end
+
+-- ── Stored lockouts (the options window's Lockouts page) ──────────────────────
+-- A read-only view over EVERY stored session rather than just the active one. The HUD only ever shows
+-- DB.sessions[currentRaidID], so the four or five other raids a character holds have until now been
+-- reachable only through DebugRaid.
+
+-- What a stored raid's counts are actually worth, phrased for a reader. It lives here and not in the UI for
+-- the same reason FormatClock does: it is CheckLockout's own three signals restated, and a page that
+-- re-derived them could drift from the rules that actually fire.
+--
+-- This matters more than it looks. CheckLockout only ever runs on the ACTIVE session, so a stranded raid's
+-- counts are already condemned: they are wiped the moment you walk back into that instance. Listing them
+-- with no warning would teach the user the addon lost their raid, which is the same reading the staleness
+-- decay message exists to prevent.
+local function LockoutState(s)
+    local now = time()
+    if s.lockResetAt then
+        if s.lockResetAt > now then
+            return "Resets in " .. RDC.FormatDuration(s.lockResetAt - now)
+        end
+        return "Expired - counts clear when you next enter"
+    end
+    -- Saved, but the server gave no reset countdown when we stamped it. Stamped is still stamped: signal
+    -- (2) can wipe this on a different lockout id, so it is not the decay case.
+    if s.lockID then return "Saved to this lockout" end
+    -- Unstamped: no boss was killed, so there is no lockout to hang the counts on and the staleness decay
+    -- is the only thing that will ever clear them. Measured off lastSeen exactly as CheckLockout measures it.
+    local left = STALE_SESSION - (now - (s.lastSeen or s.started or now))
+    if left <= 0 then return "Not saved (no boss killed) - clears when you next enter" end
+    return ("Not saved (no boss killed) - clears in %s if left idle")
+        :format(RDC.FormatDuration(left))
+end
+
+-- One entry per stored session that has deaths in it, most recently played first.
+--
+-- Sessions with no deaths are filtered out, and that is not tidiness. CheckLockout's wipe leaves the row in
+-- place holding nothing, so after a weekly reset every raid the character has ever entered would list as a
+-- zero; and a legacy "lock:" key that UpdateRaidID never got to migrate shows up as a phantom second entry
+-- for an instance that already has a real one.
+--
+-- Ordered on lastSeen and NOT on started, which is what PruneSessions sorts by: the wipe sets started = now,
+-- so a raid cleared last week would otherwise sort as newer than one genuinely played since. Falls back to
+-- started for rows written before lastSeen existed, and ties break on the id so the order cannot shuffle
+-- between two openings of the window.
+function RDC.GetLockouts()
+    local out = {}
+    if not DB or not DB.sessions then return out end
+    for rid, s in pairs(DB.sessions) do
+        local deaths = 0
+        for _, p in pairs(s.players or {}) do deaths = deaths + (p.deaths or 0) end
+        if deaths > 0 then
+            out[#out + 1] = {
+                rid           = rid,
+                instance      = s.instance,
+                mapID         = s.mapID,
+                deaths        = deaths,
+                combatSeconds = s.combatSeconds or 0,
+                seen          = s.lastSeen or s.started or 0,
+                state         = LockoutState(s),
+            }
+        end
+    end
+    table.sort(out, function(a, b)
+        if a.seen ~= b.seen then return a.seen > b.seen end
+        return a.rid < b.rid
+    end)
+    return out
+end
+
+-- Rows for one stored raid, built by the same rules the HUD's own rows are. Deliberately NOT demo-guarded
+-- the way GetSnapshot is: this browses what is actually saved, and there is nothing about stored history to
+-- preview.
+function RDC.GetLockoutRows(rid)
+    local s = DB and DB.sessions and DB.sessions[rid]
+    return SnapshotOf(s and s.players)
 end
 
 -- ── Demo / UI-preview mode ─────────────────────────────────────────────────────

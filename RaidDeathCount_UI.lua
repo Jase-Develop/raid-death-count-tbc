@@ -49,6 +49,13 @@ local function ApplyFlat(frame, color, border)
     end
 end
 
+-- Stored names carry the realm for a cross-realm player ("Bob-Frostmourne"), since GetUnitName(unit, true)
+-- is the key everything else is looked up by. Every surface that DISPLAYS one trims it, so the trim is here
+-- rather than inlined at each of them.
+local function ShortName(name)
+    return name and (name:match("^[^-]+") or name) or name
+end
+
 -- ── HUD frame ─────────────────────────────────────────────────────────────────
 local hud = CreateFrame("Frame", "RaidDeathCount_HUD", UIParent, "BackdropTemplate")
 hud:SetSize(DEF_W, DEF_H)
@@ -198,6 +205,10 @@ local function MakeFlatButton(parent, w, h, label, fontSize, tooltip)
     end
     function b:SetTint(c) tint = c; self:MarkActive(self.active) end
     function b:SetLabel(s) tx:SetText(s) end
+    -- For a caller that sizes the button to its own text rather than to a fixed grid, which the report
+    -- panel and the channel menu both do and the Lockouts page cannot: a raid button is as wide as its
+    -- raid's name and count.
+    function b:LabelWidth() return tx:GetStringWidth() end
 
     b:SetScript("OnEnter", function(self)
         local c = tint or THEME.accent
@@ -339,7 +350,7 @@ syncTag:SetScript("OnEnter", function(self)
             -- A peer heard via any op but not yet via H has no version recorded, so show "?" rather than
             -- claiming a version we were never told. The 30s heartbeat resolves it shortly.
             GameTooltip:AddLine(("   %s  |cffd9a066v%s|r"):format(
-                p.name:match("^[^-]+") or p.name, p.ver or "?"), 0.8, 0.8, 0.8)
+                ShortName(p.name), p.ver or "?"), 0.8, 0.8, 0.8)
         end
         if #odd > ODD_CAP then
             GameTooltip:AddLine(("   + %d more"):format(#odd - ODD_CAP), 0.6, 0.6, 0.6)
@@ -903,8 +914,7 @@ function RDC.RefreshHUD()
             end
 
             row.rank:SetText(index)   -- absolute placing in the snapshot, not the row slot
-            local shortName = e.name:match("^[^-]+") or e.name
-            row.name:SetText(shortName)
+            row.name:SetText(ShortName(e.name))
             row.name:SetTextColor(r, g, b)
             row.count:SetText(e.deaths)
             row:Show()
@@ -1298,6 +1308,422 @@ do
         "|cff66baffOpen this window any time with /rdc options, or by right-clicking the minimap icon.|r")
 end
 
+-- ── Lockouts page ─────────────────────────────────────────────────────────────
+-- A browser over every raid this character has stored, not just the one the HUD is showing. The HUD only
+-- ever renders DB.sessions[currentRaidID], so until now the four or five other raids sitting in the saved
+-- variables were reachable only through DebugRaid.
+--
+-- Read only and repainted on show rather than live: the data it reads changes only while you are inside a
+-- raid, which is exactly when this window is not open. ShowOptPage already calls OnPageShow, so opening the
+-- window or switching to this page IS the refresh, with no OnUpdate and no events.
+--
+-- Every raid carries its reset STATE beside its counts, which is the point of the page rather than a
+-- decoration. CheckLockout only ever runs on the active session, so a stranded raid's counts are already
+-- condemned and vanish the moment you walk back into that instance. Listing them bare would read as the
+-- addon having lost the raid. The wording is built in the core beside CheckLockout itself, so the page
+-- cannot drift from the rules that actually fire.
+do
+    local LOCK_BTN_H    = 20
+    local LOCK_BTN_GAP  = 6
+    local LOCK_ROW_POOL = 40
+
+    local page = NewOptPage("lockouts", "Lockouts",
+        "Raids with deaths recorded. Each one clears itself when its lockout resets.")
+
+    -- ── The raid buttons ──
+    -- Its own box so everything below can anchor off the BOTTOM of however many lines the buttons wrapped
+    -- to, rather than off a guessed offset that a second line would overrun.
+    local btnBox = CreateFrame("Frame", nil, page)
+    btnBox:SetPoint("TOPLEFT",  page, "TOPLEFT",   4, -4)
+    btnBox:SetPoint("TOPRIGHT", page, "TOPRIGHT", -4, -4)
+    btnBox:SetHeight(LOCK_BTN_H)
+
+    local rule = page:CreateTexture(nil, "ARTWORK")
+    rule:SetColorTexture(THEME.border[1], THEME.border[2], THEME.border[3], 1)
+    rule:SetPoint("TOPLEFT",  btnBox, "BOTTOMLEFT",  0, -6)
+    rule:SetPoint("TOPRIGHT", btnBox, "BOTTOMRIGHT", 0, -6)
+    rule:SetHeight(1)
+
+    -- ── The selected raid ──
+    -- One container for the whole readout, so the empty case is a single Hide rather than five of them.
+    local detail = CreateFrame("Frame", nil, page)
+    detail:SetPoint("TOPLEFT",     rule, "BOTTOMLEFT",  0, -8)
+    detail:SetPoint("BOTTOMRIGHT", page, "BOTTOMRIGHT", -4, 0)
+
+    -- Both horizontal anchors, so its BOTTOMRIGHT is the pane's edge and the stats row below can hang off
+    -- it. A name-width FontString would drag the whole column in with it.
+    local instName = detail:CreateFontString(nil, "OVERLAY")
+    ApplyFont(instName, OPT_BODY_FS)
+    instName:SetPoint("TOPLEFT",  detail, "TOPLEFT",  2, 0)
+    instName:SetPoint("TOPRIGHT", detail, "TOPRIGHT", 0, 0)
+    instName:SetJustifyH("LEFT")
+    instName:SetTextColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
+
+    -- Deaths, clock, DPM in the stats-hud's own left/centre/right order, so the two surfaces read the same
+    -- way round: the derived figure sits after both the numbers it was derived from.
+    local statsRow = CreateFrame("Frame", nil, detail)
+    statsRow:SetHeight(16)
+    statsRow:SetPoint("TOPLEFT",  instName, "BOTTOMLEFT",  0, -6)
+    statsRow:SetPoint("TOPRIGHT", instName, "BOTTOMRIGHT", 0, -6)
+
+    local deathsFS = statsRow:CreateFontString(nil, "OVERLAY")
+    ApplyFont(deathsFS, OPT_BODY_FS)
+    deathsFS:SetPoint("LEFT", statsRow, "LEFT", 0, 0)
+    deathsFS:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+
+    local clockFS = statsRow:CreateFontString(nil, "OVERLAY")
+    ApplyFont(clockFS, OPT_BODY_FS)
+    clockFS:SetPoint("CENTER", statsRow, "CENTER", 0, 0)
+    clockFS:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+
+    local dpmFS = statsRow:CreateFontString(nil, "OVERLAY")
+    ApplyFont(dpmFS, OPT_BODY_FS)
+    dpmFS:SetPoint("RIGHT", statsRow, "RIGHT", -4, 0)
+    dpmFS:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+
+    -- Dim, because it is context rather than data, and wrapping, because the unstamped wording is the long
+    -- one and the pane is only ~470px at the window's minimum.
+    local stateFS = detail:CreateFontString(nil, "OVERLAY")
+    ApplyFont(stateFS, OPT_LABEL_FS)
+    stateFS:SetPoint("TOPLEFT",  statsRow, "BOTTOMLEFT",  0, -4)
+    stateFS:SetPoint("TOPRIGHT", statsRow, "BOTTOMRIGHT", 0, -4)
+    stateFS:SetJustifyH("LEFT")
+    stateFS:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+
+    local rule2 = detail:CreateTexture(nil, "ARTWORK")
+    rule2:SetColorTexture(THEME.border[1], THEME.border[2], THEME.border[3], 1)
+    rule2:SetPoint("TOPLEFT",  stateFS, "BOTTOMLEFT",  -2, -6)
+    rule2:SetPoint("TOPRIGHT", stateFS, "BOTTOMRIGHT",  0, -6)
+    rule2:SetHeight(1)
+
+    -- The wheel is enabled and the MOUSE deliberately is not. The window's resize grip sits underneath the
+    -- content pane, so a list that swallowed clicks would leave the window unresizable from its own corner;
+    -- enabling the wheel does not enable clicks (same reason the HUD's rows can take a click without
+    -- stealing its scroll).
+    local list = CreateFrame("Frame", nil, detail)
+    list:SetPoint("TOPLEFT",     rule2,  "BOTTOMLEFT",  2, -4)
+    list:SetPoint("BOTTOMRIGHT", detail, "BOTTOMRIGHT", 0, 4)
+
+    local entries  = {}   -- the last GetLockouts() result, held so a resize can re-lay the buttons
+    local selected        -- rid of the raid being shown
+    local scroll   = 0
+
+    -- ── Scrollbar ──
+    -- The death-hud's bar rebuilt against this list rather than shared with it. That version is welded to
+    -- `body`, its own `scrollOffset` and RDC.RefreshHUD, so sharing would mean reworking a scroll path that
+    -- is confirmed working in game to gain a helper with two callers. SCROLL_W and THUMB_MIN are the same
+    -- top-level constants, so the two bars cannot drift on the metrics anyone can see.
+    --
+    -- The track stops short of the list's bottom, which is not cosmetic: the window's resize grip sits in
+    -- that corner, and the thumb is the one mouse-enabled thing on this page. Without the gap a thumb
+    -- scrolled to the end would sit over the grip and eat the clicks that resize the window.
+    local LOCK_GRIP_CLEAR = 12
+
+    local lockTrack = CreateFrame("Frame", nil, list, "BackdropTemplate")
+    lockTrack:SetWidth(SCROLL_W)
+    lockTrack:SetPoint("TOPRIGHT",    list, "TOPRIGHT",    0, 0)
+    lockTrack:SetPoint("BOTTOMRIGHT", list, "BOTTOMRIGHT", 0, LOCK_GRIP_CLEAR)
+    ApplyFlat(lockTrack, THEME.panel, false)
+    lockTrack:Hide()
+
+    local lockThumb = CreateFrame("Frame", nil, lockTrack, "BackdropTemplate")
+    lockThumb:SetWidth(SCROLL_W)
+    lockThumb:SetHeight(THUMB_MIN)
+    lockThumb:SetPoint("TOP", lockTrack, "TOP", 0, 0)
+    ApplyFlat(lockThumb, THEME.dim, false)
+    lockThumb:EnableMouse(true)
+
+    local function LockThumbColor(c)
+        if lockThumb.SetBackdropColor then lockThumb:SetBackdropColor(c[1], c[2], c[3], c[4] or 1) end
+    end
+
+    local function VisibleLockRows()
+        return math.max(0, math.floor((list:GetHeight() or 0) / ROW_H))
+    end
+
+    -- Sizes and places the thumb for the current offset, and reports whether the bar is showing so the
+    -- caller can inset the rows and keep the count text clear of it.
+    local function UpdateLockBar(total, visible)
+        if visible <= 0 or total <= visible then
+            lockTrack:Hide()
+            return false
+        end
+        lockTrack:Show()
+        local trackH = lockTrack:GetHeight()
+        local thumbH = math.min(trackH, math.max(THUMB_MIN, trackH * (visible / total)))
+        lockThumb:SetHeight(thumbH)
+        local maxOff = total - visible
+        local progress = (maxOff > 0) and (scroll / maxOff) or 0
+        lockThumb:ClearAllPoints()
+        lockThumb:SetPoint("TOP", lockTrack, "TOP", 0, -progress * (trackH - thumbH))
+        return true
+    end
+
+    local emptyFS = page:CreateFontString(nil, "OVERLAY")
+    ApplyFont(emptyFS, OPT_BODY_FS)
+    emptyFS:SetPoint("CENTER", page, "CENTER", 0, 0)
+    emptyFS:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+    emptyFS:SetText("No raids with deaths recorded yet.")
+    emptyFS:Hide()
+
+    -- ── Rows ──
+    -- The death-hud's row shape rebuilt without its interaction: no mouse and no ctrl-click report, because
+    -- reporting a player from a raid you are not standing in would post last week's number to raid chat.
+    -- Named apart from the HUD's own `rows` pool rather than shadowing it, since both are in scope here.
+    local lockRows = {}
+
+    local function MakeLockRow()
+        local r = CreateFrame("Frame", nil, list)
+        r:SetHeight(ROW_H - 1)
+
+        r.bar = r:CreateTexture(nil, "BACKGROUND")
+        r.bar:SetTexture("Interface\\Buttons\\WHITE8X8")
+        r.bar:SetPoint("TOPLEFT",    r, "TOPLEFT",    0, 0)
+        r.bar:SetPoint("BOTTOMLEFT", r, "BOTTOMLEFT", 0, 0)
+
+        r.rank = r:CreateFontString(nil, "OVERLAY")
+        ApplyFont(r.rank, 10)
+        r.rank:SetPoint("LEFT", r, "LEFT", 3, 0)
+        r.rank:SetWidth(18)
+        r.rank:SetJustifyH("LEFT")
+        r.rank:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+
+        r.icon = r:CreateTexture(nil, "OVERLAY")
+        r.icon:SetSize(ROW_H - 4, ROW_H - 4)
+        r.icon:SetPoint("LEFT", r.rank, "RIGHT", 1, 0)
+
+        r.name = r:CreateFontString(nil, "OVERLAY")
+        ApplyFont(r.name, 11)
+        r.name:SetPoint("LEFT", r.icon, "RIGHT", 3, 0)
+        r.name:SetJustifyH("LEFT")
+        r.name:SetWordWrap(false)
+
+        r.count = r:CreateFontString(nil, "OVERLAY")
+        ApplyFont(r.count, 11)
+        r.count:SetPoint("RIGHT", r, "RIGHT", -4, 0)
+        r.count:SetJustifyH("RIGHT")
+        r.count:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
+
+        r.name:SetPoint("RIGHT", r.count, "LEFT", -4, 0)
+        return r
+    end
+
+    local function RefreshRows()
+        local snap = selected and RDC.GetLockoutRows(selected) or {}
+        local total = #snap
+        -- Divisor is the overall leader, not the top visible row, so bar widths stay comparable between
+        -- screenfuls exactly as they do on the HUD.
+        local top = (snap[1] and snap[1].deaths) or 1
+        local maxRows = VisibleLockRows()
+
+        -- Clamped both ways here rather than in the wheel handler, so a resize that reveals more rows
+        -- cannot leave the view stranded past the end either. Ahead of the bar update, which paints the
+        -- thumb from this offset.
+        local maxScroll = math.max(0, total - maxRows)
+        if scroll > maxScroll then scroll = maxScroll end
+        if scroll < 0 then scroll = 0 end
+
+        local scrolling = UpdateLockBar(total, maxRows)
+        local inset = scrolling and -(SCROLL_W + 2) or 0
+        local w = math.max(1, (list:GetWidth() or 1) + inset)
+
+        for slot = 1, LOCK_ROW_POOL do
+            local e = (slot <= maxRows) and snap[slot + scroll] or nil
+            if e then
+                local r = lockRows[slot]
+                if not r then r = MakeLockRow(); lockRows[slot] = r end
+                r:ClearAllPoints()
+                r:SetPoint("TOPLEFT",  list, "TOPLEFT",  0,     -(slot - 1) * ROW_H)
+                r:SetPoint("TOPRIGHT", list, "TOPRIGHT", inset, -(slot - 1) * ROW_H)
+
+                local c = RAID_CLASS_COLORS and e.class and RAID_CLASS_COLORS[e.class]
+                local cr, cg, cb = 0.4, 0.4, 0.4
+                if c then cr, cg, cb = c.r, c.g, c.b end
+
+                r.bar:SetWidth(w * math.max(0.12, e.deaths / top))
+                r.bar:SetVertexColor(cr, cg, cb, BAR_ALPHA)
+
+                if e.class and CLASS_ICON_TCOORDS and CLASS_ICON_TCOORDS[e.class] then
+                    r.icon:SetTexture(CLASS_TEX)
+                    r.icon:SetTexCoord(unpack(CLASS_ICON_TCOORDS[e.class]))
+                    r.icon:Show()
+                else
+                    r.icon:Hide()
+                end
+
+                r.rank:SetText(slot + scroll)
+                r.name:SetText(ShortName(e.name))
+                r.name:SetTextColor(cr, cg, cb)
+                r.count:SetText(e.deaths)
+                r:Show()
+            elseif lockRows[slot] then
+                lockRows[slot]:Hide()
+            end
+        end
+    end
+
+    local function LockMaxScroll()
+        local total = selected and #RDC.GetLockoutRows(selected) or 0
+        return math.max(0, total - VisibleLockRows())
+    end
+
+    local function ScrollLockTo(offset)
+        local want = math.max(0, math.min(LockMaxScroll(), offset))
+        if want == scroll then return end
+        scroll = want
+        RefreshRows()
+    end
+
+    -- The wheel is on the LIST, and the mouse deliberately is not: the resize grip sits under the content
+    -- pane, and enabling the wheel does not enable clicks. Only the thumb takes a click, and the track's
+    -- bottom gap is what keeps it off the grip.
+    list:EnableMouseWheel(true)
+    list:SetScript("OnMouseWheel", function(_, delta) ScrollLockTo(scroll - delta) end)
+
+    -- How many rows fit is measured off this frame's resolved height, which is zero until the anchors have
+    -- settled on a first open. Repainting when the size lands covers that without a guess, and doubles as
+    -- the resize handler, since RefreshRows changes nothing this event depends on.
+    list:SetScript("OnSizeChanged", RefreshRows)
+
+    -- Cursor-to-thumb-top distance captured on mouse down, so grabbing mid-thumb does not snap it.
+    local lockGrab = nil
+
+    local function LockThumbDrag(self)
+        -- OnMouseUp only arrives if the release happens over the thumb, so poll the button instead: a drag
+        -- that ends off-frame has to let go too.
+        if not IsMouseButtonDown("LeftButton") then
+            lockGrab = nil
+            self:SetScript("OnUpdate", nil)
+            if not self:IsMouseOver() then LockThumbColor(THEME.dim) end
+            return
+        end
+        local span = lockTrack:GetHeight() - self:GetHeight()
+        if span <= 0 then return end
+        local _, cursorY = GetCursorPosition()
+        cursorY = cursorY / lockTrack:GetEffectiveScale()
+        local progress = math.max(0, math.min(1, ((lockTrack:GetTop() - cursorY) - lockGrab) / span))
+        ScrollLockTo(math.floor(progress * LockMaxScroll() + 0.5))
+    end
+
+    lockThumb:SetScript("OnMouseDown", function(self)
+        local _, cursorY = GetCursorPosition()
+        lockGrab = self:GetTop() - (cursorY / self:GetEffectiveScale())
+        LockThumbColor(THEME.accent)
+        self:SetScript("OnUpdate", LockThumbDrag)
+    end)
+    lockThumb:SetScript("OnEnter", function() LockThumbColor(THEME.accent) end)
+    lockThumb:SetScript("OnLeave", function() if not lockGrab then LockThumbColor(THEME.dim) end end)
+
+    local buttons = {}
+
+    local function Select(rid)
+        selected = rid
+        scroll = 0
+        local e
+        for i = 1, #entries do
+            local x = entries[i]
+            if x.rid == rid then e = x end
+            if buttons[i] then buttons[i]:MarkActive(x.rid == rid) end
+        end
+        if e then
+            instName:SetText(e.instance or "Unknown raid")
+            deathsFS:SetText("Deaths " .. e.deaths)
+            clockFS:SetText(RDC.FormatClock(e.combatSeconds))
+            dpmFS:SetText("DPM " .. RDC.FormatDPM(e.deaths, e.combatSeconds))
+            stateFS:SetText(e.state or "")
+        end
+        RefreshRows()
+    end
+
+    -- Greedy wrap, each line then centred on its own width. The buttons are sized to their labels, so the
+    -- number that fits a line changes with both the window width and which raids are stored.
+    local function LayoutButtons()
+        local n = #entries
+        local avail = page:GetWidth()
+        if not avail or avail < 1 then avail = optContent:GetWidth() or OPT_MIN_W end
+        avail = math.max(1, avail - 8)
+
+        local lines, line, lineW = {}, {}, 0
+        for i = 1, n do
+            local b = buttons[i]
+            local w = b:GetWidth()
+            if #line > 0 and lineW + LOCK_BTN_GAP + w > avail then
+                lines[#lines + 1] = { w = lineW, items = line }
+                line, lineW = {}, 0
+            end
+            if #line > 0 then lineW = lineW + LOCK_BTN_GAP end
+            line[#line + 1] = b
+            lineW = lineW + w
+        end
+        if #line > 0 then lines[#lines + 1] = { w = lineW, items = line } end
+
+        for li = 1, #lines do
+            local L = lines[li]
+            local x = math.max(0, (avail - L.w) / 2)
+            for _, b in ipairs(L.items) do
+                b:ClearAllPoints()
+                b:SetPoint("TOPLEFT", btnBox, "TOPLEFT", x, -(li - 1) * (LOCK_BTN_H + LOCK_BTN_GAP))
+                x = x + b:GetWidth() + LOCK_BTN_GAP
+            end
+        end
+
+        local nl = math.max(1, #lines)
+        btnBox:SetHeight(nl * LOCK_BTN_H + (nl - 1) * LOCK_BTN_GAP)
+    end
+
+    -- Rebuilt from scratch on every show: the set of stored raids changes rarely, but it does change, and
+    -- PruneSessions caps it at 11 so there is nothing to gain from tracking deltas.
+    local function Refresh()
+        entries = (RDC.GetLockouts and RDC.GetLockouts()) or {}
+        local n = #entries
+
+        for i = 1, n do
+            local e = entries[i]
+            local b = buttons[i]
+            if not b then
+                b = MakeFlatButton(btnBox, 10, LOCK_BTN_H, "", OPT_LABEL_FS)
+                -- The accent tint is what buys the third state: hover already takes the text to full
+                -- colour, so without the border a hovered button and the chosen one look identical.
+                b:SetTint(THEME.accent)
+                b:SetScript("OnClick", function(self) Select(self.rid) end)
+                buttons[i] = b
+            end
+            b.rid = e.rid
+            -- The abbreviation, not the full name: "SSC" against "Coilfang: Serpentshrine Cavern" is the
+            -- difference between four buttons on a line and one. The full name is the detail header's job.
+            b:SetLabel(("%s - %d"):format(ShortInstance(e.instance, e.mapID) or "?", e.deaths))
+            b:SetWidth(b:LabelWidth() + 16)
+            b:Show()
+        end
+        for i = n + 1, #buttons do buttons[i]:Hide() end
+
+        emptyFS:SetShown(n == 0)
+        detail:SetShown(n > 0)
+
+        if n == 0 then
+            selected = nil
+            btnBox:SetHeight(LOCK_BTN_H)
+            return
+        end
+
+        LayoutButtons()
+        -- Hold the selection across a reopen when that raid is still stored, so switching pages and coming
+        -- back does not throw you to the top of the list.
+        local keep
+        for i = 1, n do if entries[i].rid == selected then keep = selected end end
+        Select(keep or entries[1].rid)
+    end
+
+    page.OnPageShow = Refresh
+    -- A page fills the content pane, so it resizes with the window: rewrap the buttons and re-measure how
+    -- many rows now fit. Guarded on being shown because every page gets the event, not just the visible one.
+    page:SetScript("OnSizeChanged", function()
+        if not page:IsShown() or #entries == 0 then return end
+        LayoutButtons()
+        RefreshRows()
+    end)
+end
+
 -- ── Side menu items ───────────────────────────────────────────────────────────
 -- Built after the pages so every entry has something to show. One flat button per page, stacked from the
 -- sidebar's top: accent fill and dark text when selected, transparent with a faint accent wash on hover
@@ -1309,7 +1735,8 @@ end
 -- panel's single row of buttons, where selection recolours a border instead of filling the whole row.
 do
     local OPT_NAV_ITEMS = {
-        { label = "General", page = OPT_HOME_PAGE },
+        { label = "General",  page = OPT_HOME_PAGE },
+        { label = "Lockouts", page = "lockouts" },
     }
     local navButtons = {}
     local y = 4   -- running distance from the sidebar's top edge, so items can differ in height later
