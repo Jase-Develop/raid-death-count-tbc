@@ -292,7 +292,7 @@ end
 
 -- Seconds the raid has spent in combat this lockout. Not wall clock: see the inCombat declaration for why.
 --
--- Demo-guarded like GetInstanceName and GetMapID, and for a stronger reason than either: demo mode fakes the
+-- Demo-guarded like GetInstanceName, and for a stronger reason: demo mode fakes the
 -- rows but a real session's clock is whatever the character happens to hold, which in town is zero, so the
 -- preview showed 29 deaths against 00:00:00 and 0.00 DPM. That is not a plausible-looking preview, it is a
 -- stats strip that reads as broken. Every consumer of the clock goes through here (the strip, the DPM cell
@@ -342,13 +342,8 @@ function RDC.GetInstanceName()
     return s and s.instance
 end
 
--- Same demo guard as GetInstanceName: without it the HUD would label demo rows with the real raid the
--- session happens to be on.
-function RDC.GetMapID()
-    if RDC.demoData then return nil end
-    local s = ActiveSession()
-    return s and s.mapID
-end
+-- RDC.GetMapID lived here and was deleted on 2026-08-11. Its only caller was the HUD title's abbreviation
+-- table, which keyed short raid names off the mapID; the title shows full names now, so nothing asks.
 
 -- ── Stored lockouts (the options window's Lockouts page) ──────────────────────
 -- A read-only view over EVERY stored session rather than just the active one. The HUD only ever shows
@@ -403,7 +398,6 @@ function RDC.GetLockouts()
             out[#out + 1] = {
                 rid           = rid,
                 instance      = s.instance,
-                mapID         = s.mapID,
                 deaths        = deaths,
                 combatSeconds = s.combatSeconds or 0,
                 seen          = s.lastSeen or s.started or 0,
@@ -1737,8 +1731,9 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
         end
     elseif cmd == "lock" then
         if RDC.ToggleLock then RDC.ToggleLock() end
-    elseif cmd == "stats" then
-        if RDC.ToggleStats then RDC.ToggleStats() end
+    -- No "stats" here any more: the strip it toggled is part of the HUD and is always shown, so there is
+    -- nothing left to switch. Removed rather than kept as a no-op, unlike the "total" report alias, which
+    -- still had a real command to point at. This one falls through to the help print.
     elseif cmd == "options" or cmd == "config" then
         if RDC.ToggleOptions then RDC.ToggleOptions() end
     elseif cmd == "minimap" then
@@ -1756,7 +1751,6 @@ SlashCmdList["RAIDDEATHCOUNT"] = function(msg)
         print("  /rdc channel [raid|party|guild]   where reports are sent")
         print("  /rdc options        settings (or right-click the minimap button)")
         print("  /rdc lock           lock/unlock HUD move + resize")
-        print("  /rdc stats          show/hide the stats bar under the HUD")
         print("  /rdc minimap        show/hide the minimap button")
         print("  /rdc demo           toggle sample data for a UI preview")
         print("  /rdc version        print the addon version")

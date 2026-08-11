@@ -21,9 +21,17 @@ local FONT_FB = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
 local HEADER_H = 18
 local ROW_H    = 18
 local PAD      = 4
-local MIN_W, MIN_H = 150, 60
+-- One padded strip: the header along the top, and the stats strip along the bottom. Both ends of the HUD
+-- cost this, which is what the height constants below are counting.
+local STATS_H  = PAD * 2 + HEADER_H
+-- Two strips plus a single row, so the smallest HUD still shows one player. It was a flat 60 while the
+-- stats strip was a separate frame hanging below and the bottom cost only PAD.
+local MIN_W, MIN_H = 150, STATS_H * 2 + ROW_H
 local MAX_W, MAX_H = 500, 700
-local DEF_W, DEF_H = 220, 200
+-- 200 while the strip lived outside; grown by the strip plus its old 2px gap, so a fresh install shows the
+-- same rows it always did and the strip comes free rather than out of the list. Same arithmetic the login
+-- migration applies to a saved height.
+local DEF_W, DEF_H = 220, 200 + STATS_H + 2
 local SCROLL_W  = 6    -- scrollbar gutter, only reserved while the bar is shown
 local THUMB_MIN = 16   -- keeps the thumb grabbable on a long list
 
@@ -120,9 +128,13 @@ header:SetScript("OnEnter", function(self)
 end)
 header:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
+-- Only the left anchor here; the right one is set on syncTag once that exists, which is what makes a long
+-- raid name truncate instead of running under the buttons. See the note there.
 local title = header:CreateFontString(nil, "OVERLAY")
 ApplyFont(title, 12)
 title:SetPoint("LEFT", header, "LEFT", 5, 0)
+title:SetJustifyH("LEFT")
+title:SetWordWrap(false)
 title:SetTextColor(THEME.text[1], THEME.text[2], THEME.text[3])
 title:SetText("Raid Death Count")
 
@@ -260,18 +272,20 @@ end
 local reportBtn = MakeFlatButton(header, HEADER_H - 4, HEADER_H - 4, "R", 10, "Reports")
 reportBtn:SetPoint("RIGHT", lockBtn, "LEFT", -2, 0)
 
--- The S pays for its own 16px rather than costing them. It is here, not in the report-hud, because it
--- toggles a persistent display rather than firing an action, and the width it costs is more than covered by
--- the total moving out of the title and into the stats-hud: "Karazhan (Total: 42)" renders ~104px against
--- ~44px for "Karazhan", so the header comes out ahead of where it was.
-local statsBtn = MakeFlatButton(header, HEADER_H - 4, HEADER_H - 4, "S", 10, "Stats")
-statsBtn:SetPoint("RIGHT", reportBtn, "LEFT", -2, 0)
-
 -- Dot + count of addons in sync (us + live peers). Hidden when ungrouped, where the number is always 1.
+-- Sat left of an S button until the stats strip moved inside the HUD and stopped being toggleable, which
+-- handed the header back 16px. Worth knowing before adding anything here: header width is what drove the
+-- report modes into the panel, and this is the first slack it has had since.
 local syncTag = CreateFrame("Frame", nil, header)
 syncTag:SetSize(26, HEADER_H - 4)
-syncTag:SetPoint("RIGHT", statsBtn, "LEFT", -5, 0)
+syncTag:SetPoint("RIGHT", reportBtn, "LEFT", -5, 0)
 syncTag:EnableMouse(true)
+
+-- The title's second anchor, set here because it hangs off the leftmost piece of furniture and that only
+-- exists now. Same pattern as a HUD row's name against its count, and for the same reason: with one anchor
+-- a FontString sizes to its text, so a full raid name would draw straight under the buttons at a narrow
+-- width. Bounded and word-wrap off, it truncates instead.
+title:SetPoint("RIGHT", syncTag, "LEFT", -4, 0)
 local syncDot = syncTag:CreateTexture(nil, "OVERLAY")
 syncDot:SetSize(9, 9)
 syncDot:SetPoint("LEFT", syncTag, "LEFT", 0, 0)
@@ -360,32 +374,22 @@ syncTag:SetScript("OnEnter", function(self)
 end)
 syncTag:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
--- ── Stats HUD ─────────────────────────────────────────────────────────────────
--- A persistent strip under the death-hud, toggled by the header's S. Anchored to both bottom corners, so it
--- is the death-hud's width for free and stays that width through a resize; a child of it, so it travels and
--- hides with it the same way the report-hud does.
+-- ── Stats strip ───────────────────────────────────────────────────────────────
+-- A permanent strip along the death-hud's bottom edge, mirroring the header along its top: anchored to both
+-- bottom corners, so it is the HUD's width for free and stays that width through a resize.
 --
--- One deliberate difference from the report-hud: a child keeps its own shown flag, and here that is WANTED.
--- The report-hud needs an OnHide hook so closing the death-hud mid-panel does not bring it back uninvited;
--- the stats-hud is a display rather than a transient menu, so coming back exactly as you left it is right,
--- and the saved statsShown pref is what carries that across a reload.
-local STATS_H      = PAD * 2 + HEADER_H
+-- It used to be its own frame (RaidDeathCount_StatsHUD) hanging BELOW the HUD, toggled by a header S and
+-- remembered in a statsShown pref. All of that is gone. Inside the HUD there is nothing for an outer frame
+-- to contribute: the HUD already draws the background and the border, so a second slab would only show as a
+-- doubled edge. What is left is the inner strip, anchored where the header's is.
+--
+-- STATS_H is up with the other height constants, since MIN_H and DEF_H are both counted in terms of it.
 local LABEL_MIN_W  = 190   -- below this the labels are dropped and the values kept: see RefreshStats
 
-local statsHUD = CreateFrame("Frame", "RaidDeathCount_StatsHUD", hud, "BackdropTemplate")
-statsHUD:SetHeight(STATS_H)
-statsHUD:SetPoint("TOPLEFT", hud, "BOTTOMLEFT", 0, -2)
-statsHUD:SetPoint("TOPRIGHT", hud, "BOTTOMRIGHT", 0, -2)
-ApplyFlat(statsHUD, THEME.bg, true)
--- Same reason the death-hud body enables the mouse with no drag handler: swallow clicks rather than letting
--- them fall through to the world behind. Dragging stays the death-hud title bar's job.
-statsHUD:EnableMouse(true)
-statsHUD:Hide()
-
-local statsStrip = CreateFrame("Frame", nil, statsHUD, "BackdropTemplate")
+local statsStrip = CreateFrame("Frame", nil, hud, "BackdropTemplate")
 statsStrip:SetHeight(HEADER_H)
-statsStrip:SetPoint("TOPLEFT", statsHUD, "TOPLEFT", PAD, -PAD)
-statsStrip:SetPoint("TOPRIGHT", statsHUD, "TOPRIGHT", -PAD, -PAD)
+statsStrip:SetPoint("BOTTOMLEFT",  hud, "BOTTOMLEFT",   PAD, PAD)
+statsStrip:SetPoint("BOTTOMRIGHT", hud, "BOTTOMRIGHT", -PAD, PAD)
 ApplyFlat(statsStrip, THEME.panel, true)
 
 local deathsLabel = statsStrip:CreateFontString(nil, "OVERLAY")
@@ -432,11 +436,12 @@ local FormatClock, FormatDPM = RDC.FormatClock, RDC.FormatDPM
 -- the tick below instead, which is what keeps this off the once-a-second path.
 -- Cached for the tick below, which needs the total to recompute DPM and must not rebuild and re-sort a
 -- snapshot to get it. Every path that changes the total goes through RefreshHUD, so this cannot go stale
--- while the strip is up, and showing the strip calls RefreshStats before the tick can read it.
+-- while the strip is up, and showing the HUD calls RefreshHUD before the tick can read it.
 local lastDeathSum = 0
 
+-- No shown-check of its own any more: the only caller is RefreshHUD, which has already returned early if the
+-- HUD is hidden, and the strip can no longer be hidden on its own.
 local function RefreshStats(deathSum)
-    if not statsHUD:IsShown() then return end
     -- Measured on the death-hud, not the strip: they are equal by construction and the strip's anchors
     -- have not resolved yet while a resize is still in flight.
     local labels = hud:GetWidth() >= LABEL_MIN_W
@@ -448,9 +453,11 @@ local function RefreshStats(deathSum)
     dpmValue:SetText(FormatDPM(lastDeathSum, RDC.GetCombatSeconds()))
 end
 
--- WoW does not fire OnUpdate on a hidden frame, so hanging the driver on the stats-hud itself makes "only
--- runs while shown" fall out of the frame hierarchy: hiding the strip or the death-hud above it stops the
--- tick with no start/stop bookkeeping to get wrong.
+-- WoW does not fire OnUpdate on a hidden frame, so hanging the driver on the strip itself makes "only runs
+-- while shown" fall out of the frame hierarchy: hiding the death-hud stops the tick with no start/stop
+-- bookkeeping to get wrong. That still holds now the strip is part of the HUD, but it means something
+-- slightly different: the tick runs whenever the HUD is open, where it used to also need the strip toggled
+-- on. That is one clock repaint a second and a DPM recompute every five, so the cost is nil.
 --
 -- DPM gets a slower beat than the clock on purpose. Its rate of change is -60*D/t^2, so early in a pull the
 -- second decimal moves several units a second, which is noise on a figure nobody reads mid-fight. Out of
@@ -458,7 +465,7 @@ end
 -- exact and stays that way for as long as it is being looked at, which is when it is actually read.
 local DPM_INTERVAL = 5
 local statsAcc, dpmAcc = 0, 0
-statsHUD:SetScript("OnUpdate", function(_, elapsed)
+statsStrip:SetScript("OnUpdate", function(_, elapsed)
     dpmAcc = dpmAcc + elapsed
     if dpmAcc >= DPM_INTERVAL then
         dpmAcc = 0
@@ -469,23 +476,6 @@ statsHUD:SetScript("OnUpdate", function(_, elapsed)
     statsAcc = 0
     timerValue:SetText(FormatClock(RDC.GetCombatSeconds()))
 end)
-
--- Account-wide alongside the other UI prefs, per the per-character/account split: which panels this client
--- has open is a preference, not data about a raid. Defaults off, so an upgrade does not grow new furniture
--- under everyone's HUD unasked.
-function RDC.SetStatsShown(show)
-    show = show and true or false
-    local db = DB(); if db then db.statsShown = show end
-    statsHUD:SetShown(show)
-    statsBtn:MarkActive(show or nil)
-    if show then RefreshStats() end
-end
-
-function RDC.IsStatsShown() return statsHUD:IsShown() end
-
-function RDC.ToggleStats() RDC.SetStatsShown(not statsHUD:IsShown()) end
-
-statsBtn:SetScript("OnClick", function() RDC.ToggleStats() end)
 
 -- ── Report panel ──────────────────────────────────────────────────────────────
 -- Every reporting action in one place, so the header does not have to grow a button per mode. A child of
@@ -621,11 +611,11 @@ local function PositionPanel()
     panel:ClearAllPoints()
     local top, screenH = hud:GetTop(), UIParent:GetHeight()
     if top and screenH and top + panel:GetHeight() + 2 > screenH then
-        -- Clears the stats-hud when that is out, or the report-hud drops straight on top of it. Read at
-        -- open time like everything else here, since the strip can be toggled between one open and the next.
-        local below = statsHUD:IsShown() and statsHUD or hud
-        panel:SetPoint("TOPLEFT",  below, "BOTTOMLEFT",  0, -2)
-        panel:SetPoint("TOPRIGHT", below, "BOTTOMRIGHT", 0, -2)
+        -- Straight off the HUD's own bottom. This used to have to clear the stats-hud, which hung below the
+        -- HUD and could be toggled between one open and the next; the strip lives inside the HUD now, so its
+        -- height is already in hud:GetBottom() and there is nothing left to dodge.
+        panel:SetPoint("TOPLEFT",  hud, "BOTTOMLEFT",  0, -2)
+        panel:SetPoint("TOPRIGHT", hud, "BOTTOMRIGHT", 0, -2)
     else
         panel:SetPoint("BOTTOMLEFT",  hud, "TOPLEFT",  0, 2)
         panel:SetPoint("BOTTOMRIGHT", hud, "TOPRIGHT", 0, 2)
@@ -674,9 +664,12 @@ grip:SetScript("OnMouseUp", function() hud:StopMovingOrSizing(); SavePlacement()
 hud:SetScript("OnSizeChanged", function() if RDC.RefreshHUD then RDC.RefreshHUD() end end)
 
 -- ── Body / rows ───────────────────────────────────────────────────────────────
+-- Between the two strips, so the rows are what gives up space at any height rather than either strip. The
+-- bottom anchor is on the stats strip and not on the HUD, which is what makes MIN_H's job "leave one row"
+-- rather than "leave one row plus 26px I have to remember to subtract".
 local body = CreateFrame("Frame", nil, hud)
 body:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -PAD)
-body:SetPoint("BOTTOMRIGHT", hud, "BOTTOMRIGHT", -PAD, PAD)
+body:SetPoint("BOTTOMRIGHT", statsStrip, "TOPRIGHT", 0, PAD)
 
 local emptyText = body:CreateFontString(nil, "OVERLAY")
 ApplyFont(emptyText, 11)
@@ -836,27 +829,16 @@ local function MakeRow(i)
     return row
 end
 
--- Keyed by instance mapID, not by name: the mapID is the same client-side constant the RaidID is built
--- from, so this needs no locale handling and cannot be broken by a "Coilfang: " style prefix changing.
-local RAID_ABBR = {
-    [532] = "Karazhan",
-    [565] = "Gruul",
-    [544] = "Maggy",
-    [548] = "SSC",
-    [550] = "TK",
-    [534] = "Hyjal",
-    [564] = "BT",
-    [568] = "ZA",
-    [580] = "Sunwell",
-}
-
--- A known raid becomes its abbreviation; anything else falls back to trimming the cluster prefix, so
--- "Coilfang: Serpentshrine Cavern" becomes "Serpentshrine Cavern" and unprefixed names pass through.
-local function ShortInstance(name, mapID)
-    if mapID and RAID_ABBR[mapID] then return RAID_ABBR[mapID] end
+-- The raid's own name, with a cluster prefix trimmed off: "Coilfang: Serpentshrine Cavern" becomes
+-- "Serpentshrine Cavern", and every other TBC raid is unprefixed and passes straight through.
+--
+-- This used to abbreviate through a mapID -> short name table (SSC, TK, Maggy, BT), which existed because
+-- the header could not afford the full name while it was also carrying an S button and the raid total.
+-- Both of those are gone, so the abbreviations were costing legibility to save room nothing needs any more.
+-- One raid is still trimmed because "Coilfang: " names the cluster and not the raid anyone says out loud.
+local function InstanceLabel(name)
     if not name then return nil end
-    local tail = name:match("^.-:%s*(.+)$")
-    return tail or name
+    return name:match("^.-:%s*(.+)$") or name
 end
 
 -- ── Refresh ───────────────────────────────────────────────────────────────────
@@ -925,8 +907,7 @@ function RDC.RefreshHUD()
 
     -- The total lives in the stats-hud now, not here. Duplicating it cost the header ~60px it does not have
     -- at MIN_W, where the title already collides with the buttons.
-    local inst = ShortInstance(RDC.GetInstanceName(), RDC.GetMapID())
-    title:SetText(inst or "Raid Death Count")
+    title:SetText(InstanceLabel(RDC.GetInstanceName()) or "Raid Death Count")
 
     RefreshStats(deathSum)
     UpdateSyncTag()
@@ -952,6 +933,22 @@ end
 -- ── Init (restore geometry + state at login) ──────────────────────────────────
 function RDC.InitHUD()
     local db = DB(); if not db then return end
+
+    -- One-time migration for the stats strip moving INSIDE the HUD. The strip used to hang below the frame
+    -- and cost nothing from the list; now it comes out of the rows, so a saved height that showed ten rows
+    -- and a strip would show eight. Handing back the strip's height plus the 2px gap it used to sit in makes
+    -- the change occupy exactly the screen it did before and keeps every row.
+    --
+    -- statsShown IS the migration marker, which is why it is read before it is cleared: it exists only on a
+    -- DB written by a version that had the toggle, so this cannot run twice and needs no version stamp.
+    -- Only the strip's former owners get the height, since nobody else was giving up space to it.
+    if db.statsShown ~= nil then
+        if db.statsShown and db.height then
+            db.height = math.min(MAX_H, db.height + STATS_H + 2)
+        end
+        db.statsShown = nil
+    end
+
     if db.width and db.height then hud:SetSize(db.width, db.height) end
     if db.point then
         hud:ClearAllPoints()
@@ -959,7 +956,6 @@ function RDC.InitHUD()
     end
     RefreshLock()
     RDC.RefreshReportChannel()   -- the saved channel exists only now, so the dropdown is built showing "Raid"
-    RDC.SetStatsShown(db.statsShown)   -- nil on first run reads as off, which is the intended default
     if db.shown == nil then db.shown = true end   -- visible by default, Details-style
     if db.shown then hud:Show() else hud:Hide() end
     RDC.RefreshHUD()
@@ -1627,9 +1623,12 @@ do
         end
         if e then
             instName:SetText(e.instance or "Unknown raid")
-            deathsFS:SetText("Deaths " .. e.deaths)
-            clockFS:SetText(RDC.FormatClock(e.combatSeconds))
-            dpmFS:SetText("DPM " .. RDC.FormatDPM(e.deaths, e.combatSeconds))
+            -- All three labelled the same way. The strip on the HUD leaves the clock bare because it has a
+            -- fixed left-to-right reading and no room to spare; here there is room, and an unlabelled time
+            -- between two labelled figures just reads as the odd one out.
+            deathsFS:SetText(("Deaths: %d"):format(e.deaths))
+            clockFS:SetText("Combat: " .. RDC.FormatClock(e.combatSeconds))
+            dpmFS:SetText("DPM: " .. RDC.FormatDPM(e.deaths, e.combatSeconds))
             stateFS:SetText(e.state or "")
         end
         RefreshRows()
@@ -1689,9 +1688,10 @@ do
                 buttons[i] = b
             end
             b.rid = e.rid
-            -- The abbreviation, not the full name: "SSC" against "Coilfang: Serpentshrine Cavern" is the
-            -- difference between four buttons on a line and one. The full name is the detail header's job.
-            b:SetLabel(("%s - %d"):format(ShortInstance(e.instance, e.mapID) or "?", e.deaths))
+            -- The same label the HUD title uses, so a button and the raid it opens read identically. Full
+            -- names make for wide buttons, which is what the wrapping layout below is for; the detail header
+            -- keeps the untrimmed name, since there it has a line to itself.
+            b:SetLabel(("%s - %d"):format(InstanceLabel(e.instance) or "?", e.deaths))
             b:SetWidth(b:LabelWidth() + 16)
             b:Show()
         end
