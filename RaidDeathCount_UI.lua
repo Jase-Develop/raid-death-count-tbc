@@ -1300,31 +1300,43 @@ do
         "up on their own.\n\n" ..
         "Two things worth knowing. Deaths are only counted while you are physically inside a raid " ..
         "instance, so nothing you do in a dungeon, a battleground or the world is recorded. And counts " ..
-        "clear themselves when the raid's weekly lockout resets, so a new week always starts at zero.\n\n" ..
+        "clear themselves when that raid's own lockout resets, so every lockout starts at zero.\n\n" ..
         "|cff66baffOpen this window any time with /rdc options, or by right-clicking the minimap icon.|r")
 end
 
--- ── Lockouts page ─────────────────────────────────────────────────────────────
--- A browser over every raid this character has stored, not just the one the HUD is showing. The HUD only
--- ever renders DB.sessions[currentRaidID], so until now the four or five other raids sitting in the saved
--- variables were reachable only through DebugRaid.
+-- ── Active Lockouts page ──────────────────────────────────────────────────────
+-- Every TBC raid, run or not, in alphabetical order. The ones you have run this lockout carry a count and
+-- open a breakdown; the rest are inert labels. The HUD only ever renders DB.sessions[currentRaidID], so the
+-- other raids are otherwise reachable only through DebugRaid.
+--
+-- What the page is FOR is the thing to hold on to before changing it: reviewing the raids you have run this
+-- lockout, while that lockout is still current. It is explicitly NOT a historical record, and the addon does
+-- not keep one. Once a lockout rolls over its counts are worth nothing to anybody, so SweepLockouts clears
+-- them and deletes the row, and this page shows the new lockout from empty.
+--
+-- The full roster is listed rather than only what is stored so the page keeps a STABLE shape: a raid sits in
+-- the same place whether it was run tonight, run last week or never run at all, and the page reads as what
+-- is available instead of rearranging itself every lockout. That is also why the ordering is alphabetical
+-- and no longer by lastSeen. The roster itself lives in the CORE beside GetLockouts, for the same reason
+-- LockoutState does, and it carries phase 3 ahead of release so the page needs no change on the day.
 --
 -- Read only and repainted on show rather than live: the data it reads changes only while you are inside a
 -- raid, which is exactly when this window is not open. ShowOptPage already calls OnPageShow, so opening the
 -- window or switching to this page IS the refresh, with no OnUpdate and no events.
 --
 -- Every raid carries its reset STATE beside its counts, which is the point of the page rather than a
--- decoration. CheckLockout only ever runs on the active session, so a stranded raid's counts are already
--- condemned and vanish the moment you walk back into that instance. Listing them bare would read as the
--- addon having lost the raid. The wording is built in the core beside CheckLockout itself, so the page
--- cannot drift from the rules that actually fire.
+-- decoration: a raid saved for the week reads differently from one that killed no boss and is sitting on a
+-- decay timer. The wording is built in the core beside CheckLockout itself, so the page cannot drift from
+-- the rules that actually fire.
 do
     local LOCK_BTN_H    = 20
     local LOCK_BTN_GAP  = 6
     local LOCK_ROW_POOL = 40
 
-    local page = NewOptPage("lockouts", "Lockouts",
-        "Raids with deaths recorded. Each one clears itself when its lockout resets.")
+    -- The page key stays "lockouts": it is the nav's internal id and the OPT_NAV_ITEMS label is what the
+    -- user reads, so renaming the key would churn ShowOptPage's callers to no visible effect.
+    local page = NewOptPage("lockouts", "Active Lockouts",
+        "Raids you have run this lockout. Counts clear themselves when the lockout resets.")
 
     -- ── The raid buttons ──
     -- Its own box so everything below can anchor off the BOTTOM of however many lines the buttons wrapped
@@ -1480,9 +1492,12 @@ do
 
     local emptyFS = page:CreateFontString(nil, "OVERLAY")
     ApplyFont(emptyFS, OPT_BODY_FS)
-    emptyFS:SetPoint("CENTER", page, "CENTER", 0, 0)
+    -- Below the buttons rather than centred on the page, because the roster means the buttons are always
+    -- there now: a page-centred line would drift up into them at OPT_MIN_H, where the roster wraps to three
+    -- rows and leaves the least space.
+    emptyFS:SetPoint("TOP", btnBox, "BOTTOM", 0, -28)
     emptyFS:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
-    emptyFS:SetText("No raids with deaths recorded yet.")
+    emptyFS:SetText("No raids run this lockout yet.")
     emptyFS:Hide()
 
     -- ── Rows ──
@@ -1635,14 +1650,14 @@ do
 
     local buttons = {}
 
-    local function Select(rid)
-        selected = rid
+    local function Select(key)
+        selected = key
         scroll = 0
         local e
         for i = 1, #entries do
             local x = entries[i]
-            if x.rid == rid then e = x end
-            if buttons[i] then buttons[i]:MarkActive(x.rid == rid) end
+            if x.key == key then e = x end
+            if buttons[i] then buttons[i]:MarkActive(x.key == key) end
         end
         if e then
             instName:SetText(e.instance or "Unknown raid")
@@ -1712,37 +1727,69 @@ do
                 -- The accent tint is what buys the third state: hover already takes the text to full
                 -- colour, so without the border a hovered button and the chosen one look identical.
                 b:SetTint(THEME.accent)
-                b:SetScript("OnClick", function(self) Select(self.rid) end)
+                b:SetScript("OnClick", function(self) Select(self.key) end)
                 buttons[i] = b
             end
-            b.rid = e.rid
-            -- The same label the HUD title uses, so a button and the raid it opens read identically. Full
-            -- names make for wide buttons, which is what the wrapping layout below is for; the detail header
-            -- keeps the untrimmed name, since there it has a line to itself.
-            b:SetLabel(("%s - %d"):format(InstanceLabel(e.instance) or "?", e.deaths))
+            b.key = e.key
+            -- A raid that has not been run this lockout carries no count, because there is nothing to
+            -- count. The label alone is the whole point of listing it: the page reads as what is available
+            -- rather than as whatever happens to be stored.
+            if e.run then
+                b:SetLabel(("%s - %d"):format(e.label or "?", e.deaths))
+            else
+                b:SetLabel(e.label or "?")
+            end
+            -- Inert rather than merely dim, and EnableMouse is what does it: it takes OnClick, OnEnter and
+            -- OnLeave away together, so an un-run raid cannot be selected AND does not brighten under the
+            -- cursor promising that it could. Disable() was rejected, it stops the click but leaves the
+            -- hover. Both flags are re-applied every refresh, since the button pool is recycled and a slot
+            -- that held an un-run raid last time is otherwise stuck inert.
+            b:EnableMouse(e.run and true or false)
+            b:SetTint(e.run and THEME.accent or THEME.dim)
+            b:MarkActive(false)
             b:SetWidth(b:LabelWidth() + 16)
             b:Show()
         end
         for i = n + 1, #buttons do buttons[i]:Hide() end
 
-        emptyFS:SetShown(n == 0)
-        detail:SetShown(n > 0)
+        if n > 0 then LayoutButtons() else btnBox:SetHeight(LOCK_BTN_H) end
 
-        if n == 0 then
+        -- The roster means there are almost always buttons, so "nothing here" is now about whether any raid
+        -- has been RUN, not about whether the list is empty. Keep the selection when that raid is still
+        -- run, otherwise fall to the first run raid in alphabetical order.
+        local keep, firstRun
+        for i = 1, n do
+            local e = entries[i]
+            if e.run then
+                if not firstRun then firstRun = e.key end
+                if e.key == selected then keep = selected end
+            end
+        end
+
+        emptyFS:SetShown(not firstRun)
+        detail:SetShown(firstRun ~= nil)
+        if not firstRun then
             selected = nil
-            btnBox:SetHeight(LOCK_BTN_H)
+            for i = 1, n do if buttons[i] then buttons[i]:MarkActive(false) end end
             return
         end
 
-        LayoutButtons()
-        -- Hold the selection across a reopen when that raid is still stored, so switching pages and coming
-        -- back does not throw you to the top of the list.
-        local keep
-        for i = 1, n do if entries[i].rid == selected then keep = selected end end
-        Select(keep or entries[1].rid)
+        Select(keep or firstRun)
     end
 
     page.OnPageShow = Refresh
+
+    -- The one thing that can change this page's data while it is open, and the reason it is a hook rather
+    -- than a tick. The page was written on the premise that the data moves only while you are inside a raid,
+    -- which is exactly when this window is shut; SweepLockouts broke that premise by clearing and DELETING
+    -- rolled-over raids from the heartbeat, so a window left open in town can outlive the raid it is
+    -- showing. Without this, a resize afterwards repaints from the stale `entries` list and draws a button
+    -- for a raid that no longer exists, with no rows under it. Fires only on a sweep that actually changed
+    -- something, so it stays an event and never becomes polling.
+    function RDC.RefreshLockouts()
+        if page:IsVisible() then Refresh() end
+    end
+
     -- A page fills the content pane, so it resizes with the window: rewrap the buttons and re-measure how
     -- many rows now fit. Guarded on being shown because every page gets the event, not just the visible one.
     page:SetScript("OnSizeChanged", function()
@@ -1763,8 +1810,8 @@ end
 -- panel's single row of buttons, where selection recolours a border instead of filling the whole row.
 do
     local OPT_NAV_ITEMS = {
-        { label = "General",  page = OPT_HOME_PAGE },
-        { label = "Lockouts", page = "lockouts" },
+        { label = "General",         page = OPT_HOME_PAGE },
+        { label = "Active Lockouts", page = "lockouts" },
     }
     local navButtons = {}
     local y = 4   -- running distance from the sidebar's top edge, so items can differ in height later

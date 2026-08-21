@@ -364,17 +364,19 @@ end
 -- the same reason FormatClock does: it is CheckLockout's own three signals restated, and a page that
 -- re-derived them could drift from the rules that actually fire.
 --
--- This matters more than it looks. CheckLockout only ever runs on the ACTIVE session, so a stranded raid's
--- counts are already condemned: they are wiped the moment you walk back into that instance. Listing them
--- with no warning would teach the user the addon lost their raid, which is the same reading the staleness
--- decay message exists to prevent.
+-- Since SweepLockouts this is a window onto a state that does not last. Every stored session is now checked
+-- against its OWN stamp at login, on zoning and on the heartbeat, so an expired raid is cleared and deleted
+-- within HEARTBEAT rather than sitting condemned until you happen to walk back into it. The expired wordings
+-- survive for the one case the sweep cannot reach: a client with the master switch off, which is doing no
+-- housekeeping at all. They say "clear automatically" and NOT "when you next enter", which stopped being
+-- true the moment clearing stopped requiring you to go anywhere.
 local function LockoutState(s)
     local now = time()
     if s.lockResetAt then
         if s.lockResetAt > now then
             return "Resets in " .. RDC.FormatDuration(s.lockResetAt - now)
         end
-        return "Expired - counts clear when you next enter"
+        return "Expired - counts clear automatically"
     end
     -- Saved, but the server gave no reset countdown when we stamped it. Stamped is still stamped: signal
     -- (2) can wipe this on a different lockout id, so it is not the decay case.
@@ -382,48 +384,184 @@ local function LockoutState(s)
     -- Unstamped: no boss was killed, so there is no lockout to hang the counts on and the staleness decay
     -- is the only thing that will ever clear them. Measured off lastSeen exactly as CheckLockout measures it.
     local left = STALE_SESSION - (now - (s.lastSeen or s.started or now))
-    if left <= 0 then return "Not saved (no boss killed) - clears when you next enter" end
+    if left <= 0 then return "Not saved (no boss killed) - clears automatically" end
     return ("Not saved (no boss killed) - clears in %s if left idle")
         :format(RDC.FormatDuration(left))
 end
 
--- One entry per stored session that has deaths in it, most recently played first.
+-- ── The raid roster ───────────────────────────────────────────────────────────
+-- The one place the addon holds hardcoded instance knowledge, and it exists so the Active Lockouts page
+-- lists a STABLE set of raids rather than a set that changes shape every lockout. A raid you have not run
+-- shows as an inert button, so the page reads as "what is available" instead of "what happens to be
+-- stored". Note this is not a return of the mapID abbreviation table deleted on 2026-08-11: that one
+-- existed to SHORTEN names for a header with no room, where this one exists to list raids no session
+-- covers. Labels here are full and match what the HUD title shows.
 --
--- Sessions with no deaths are filtered out, and that is not tidiness. CheckLockout's wipe leaves the row in
--- place holding nothing, so after a weekly reset every raid the character has ever entered would list as a
--- zero; and a legacy "lock:" key that UpdateRaidID never got to migrate shows up as a phantom second entry
--- for an instance that already has a real one.
+-- Three fields, and the split between them is the load-bearing part.
+--   label   what the user reads, and the sort key. Chosen for the reader, so it need not be the client's
+--           own name for the instance: "Mount Hyjal" over Blizzard's "Hyjal Summit".
+--   mapID   the PRIMARY match against a stored session, since sessions are keyed "map:<id>" and a mapID is
+--           locale independent where a name is not.
+--   aliases normalised names, the FALLBACK match, and the reason a wrong mapID is survivable. Name matching
+--           is already proven here: FindLockout has matched saved-instance names against session names in
+--           production since v0.1.
+--
+-- **These are INSTANCE ids, not uiMap ids, and the two are easy to confuse because published tables list
+-- both side by side.** Karazhan is instance 532 / map 799, Gruul's Lair 565 / 776, and so on. What belongs
+-- here is the first of each pair, because it is the 8th return of GetInstanceInfo and therefore what
+-- ResolveRaidID builds the "map:<n>" session key from. Confirmed live: a client standing in Gruul's Lair
+-- reports `active: map:565`. Swapping in the uiMap column would break every match at once, and silently,
+-- since the aliases would still carry the page.
+--
+-- All nine were cross-checked against a reference table on 2026-08-21. GetLockouts below is nevertheless a
+-- UNION rather than a lookup, which is not redundancy: it means a session the roster fails to claim for ANY
+-- reason still gets its own button, so the failure is a DUPLICATE and never a hidden raid. DebugRaid prints
+-- roster= per session so a miss is visible rather than silent.
+--
+-- Unreleased content is listed ahead of time on purpose, so the page needs no change on the day it lands:
+-- Mount Hyjal, Black Temple and Zul'Aman for phase 3, and Sunwell Plateau further out. An un-run raid
+-- already renders as an inert label, so a raid that does not exist yet costs one dimmed button and nothing
+-- else.
+--
+-- Zul'Aman's shorter lockout needs NOTHING here or anywhere else: every reset is derived from the resetIn
+-- the server returns and stored as an absolute lockResetAt, and FormatDuration renders any span. Nothing in
+-- the addon assumes seven days. That is the whole payoff of judging each session against its own stamp.
+local RAID_ROSTER = {
+    { label = "Black Temple",         mapID = 564, aliases = { "black temple" } },
+    { label = "Gruul's Lair",         mapID = 565, aliases = { "gruul's lair" } },
+    { label = "Karazhan",             mapID = 532, aliases = { "karazhan" } },
+    { label = "Magtheridon's Lair",   mapID = 544, aliases = { "magtheridon's lair" } },
+    { label = "Mount Hyjal",          mapID = 534, aliases = { "hyjal summit", "mount hyjal",
+                                                               "the battle for mount hyjal" } },
+    { label = "Serpentshrine Cavern", mapID = 548, aliases = { "serpentshrine cavern" } },
+    { label = "Sunwell Plateau",      mapID = 580, aliases = { "sunwell plateau", "the sunwell" } },
+    { label = "Tempest Keep",         mapID = 550, aliases = { "tempest keep", "the eye" } },
+    { label = "Zul'Aman",             mapID = 568, aliases = { "zul'aman", "zulaman" } },
+}
+
+-- Strips a cluster prefix and nothing else, mirroring the UI's InstanceLabel so a roster miss still reads
+-- the way the rest of the addon names a raid. The same shape FindLockout already uses for its tail match.
+local function TrimCluster(s)
+    if not s or s == "" then return nil end
+    return s:match("^.-:%s*(.+)$") or s
+end
+
+local function NormalName(s)
+    local t = TrimCluster(s)
+    return t and t:lower() or nil
+end
+
+-- Which roster entry a stored session belongs to, or nil. mapID first, falling back to the aliases, and
+-- reading the id out of the "map:<n>" key when the session predates the mapID field. Shared by GetLockouts
+-- and DebugRaid so the debug line can never disagree with what the page draws.
+local function RosterFor(s, rid)
+    local mid = (s and s.mapID) or tonumber(tostring(rid or ""):match("^map:(%d+)$") or "")
+    local nn  = NormalName(s and s.instance)
+    for _, r in ipairs(RAID_ROSTER) do
+        if mid and r.mapID == mid then return r end
+        if nn then
+            for _, a in ipairs(r.aliases) do
+                if a == nn then return r end
+            end
+        end
+    end
+    return nil
+end
+
+-- One entry per ROSTER raid, plus any stored raid the roster did not claim, in alphabetical order.
+--
+-- `run` is what the page dims a button on, and it means PLAYED rather than merely stored: deaths recorded
+-- or combat time accumulated. That deliberately admits a deathless night, which is a real result (the same
+-- reasoning that puts `report stats` above the empty guard), and it excludes the empty shell a lockout wipe
+-- leaves on the ACTIVE session, which SweepLockouts cannot delete because Sweep and the OnUpdate driver
+-- both reach the active raid through DB.currentRaidID.
+--
+-- `key` and not `rid` is what the page tracks a button by, because a roster raid with no session has no
+-- rid at all. For a run raid the two are the same string, which is what keeps GetLockoutRows(selected)
+-- working unchanged.
 --
 -- `started` is carried for the page's start time, and the wipe is what gives it its meaning: it reads as
 -- "when this lockout's counting began" and NOT "when the pull started". It is written when the session
 -- row is minted, which is the zone-in that first resolved this RaidID, and rewritten to now by every
 -- CheckLockout wipe, so a raid reset last Tuesday dates from the Tuesday you walked back in.
 --
--- Ordered on lastSeen and NOT on started, which is what PruneSessions sorts by: the wipe sets started = now,
--- so a raid cleared last week would otherwise sort as newer than one genuinely played since. Falls back to
--- started for rows written before lastSeen existed, and ties break on the id so the order cannot shuffle
--- between two openings of the window.
+-- Ordered ALPHABETICALLY, replacing the old lastSeen ordering. The whole point of the roster is that the
+-- page does not rearrange itself between lockouts, so a raid has to sit in the same place whether it was
+-- run tonight, run last week or never run at all.
 function RDC.GetLockouts()
     local out = {}
-    if not DB or not DB.sessions then return out end
-    for rid, s in pairs(DB.sessions) do
+    local sessions = (DB and DB.sessions) or {}
+
+    local function Summarise(rid, s)
         local deaths = 0
         for _, p in pairs(s.players or {}) do deaths = deaths + (p.deaths or 0) end
-        if deaths > 0 then
-            out[#out + 1] = {
-                rid           = rid,
-                instance      = s.instance,
-                deaths        = deaths,
-                combatSeconds = s.combatSeconds or 0,
-                started       = s.started or 0,
-                seen          = s.lastSeen or s.started or 0,
-                state         = LockoutState(s),
-            }
+        return {
+            rid           = rid,
+            key           = rid,
+            instance      = s.instance,
+            deaths        = deaths,
+            combatSeconds = s.combatSeconds or 0,
+            started       = s.started or 0,
+            seen          = s.lastSeen or s.started or 0,
+            state         = LockoutState(s),
+            run           = deaths > 0 or (s.combatSeconds or 0) > 0,
+        }
+    end
+
+    -- One session per roster entry. A legacy "lock:" key and a "map:" key can both resolve to the same
+    -- raid, so the one holding more deaths wins rather than whichever pairs() reached first.
+    local claim = {}
+    for rid, s in pairs(sessions) do
+        local r = RosterFor(s, rid)
+        if r then
+            local cur = claim[r.label]
+            if not cur then
+                claim[r.label] = rid
+            else
+                local a, b = 0, 0
+                for _, p in pairs(sessions[cur].players or {}) do a = a + (p.deaths or 0) end
+                for _, p in pairs(s.players or {})            do b = b + (p.deaths or 0) end
+                if b > a then claim[r.label] = rid end
+            end
         end
     end
+
+    local used = {}
+    for _, r in ipairs(RAID_ROSTER) do
+        local rid = claim[r.label]
+        local e
+        if rid and sessions[rid] then
+            e = Summarise(rid, sessions[rid])
+            used[rid] = true
+        else
+            e = { deaths = 0, combatSeconds = 0, started = 0, seen = 0, run = false }
+            e.key = "roster:" .. r.label
+        end
+        e.label = r.label
+        -- The BUTTON and the detail header both read the roster label, which is what keeps "a button and
+        -- the raid it opens read identically" true now that a label can differ from the client's own name:
+        -- "Mount Hyjal" must not become "Hyjal Summit" the instant a session exists behind it. It also
+        -- drops the cluster prefix from the header for free, so the raid reads the same in both places.
+        e.instance = r.label
+        out[#out + 1] = e
+    end
+
+    -- Anything stored that the roster did not claim still gets a button, which is what makes a wrong mapID
+    -- cosmetic instead of destructive. Filtered on `run` for the same reason the old zero-death filter
+    -- existed: an empty shell has nothing to show.
+    for rid, s in pairs(sessions) do
+        if not used[rid] then
+            local e = Summarise(rid, s)
+            if e.run then
+                e.label = TrimCluster(s.instance) or rid
+                out[#out + 1] = e
+            end
+        end
+    end
+
     table.sort(out, function(a, b)
-        if a.seen ~= b.seen then return a.seen > b.seen end
-        return a.rid < b.rid
+        if a.label ~= b.label then return a.label < b.label end
+        return tostring(a.key) < tostring(b.key)
     end)
     return out
 end
@@ -1091,13 +1229,54 @@ end
 -- spans a week (clear on Tuesday, continue on Thursday) and must never decay, for the same reason
 -- combatSeconds concatenates across nights. Derived locally like the other two, so every client reaches
 -- the same verdict with nothing crossing the wire and nobody holding authority.
-local function CheckLockout(s, iname)
+--
+-- All three run against EVERY stored session, not just the active one: see SweepLockouts below.
+
+-- The half of the wipe that belongs to the raid we are standing in and to no other. This is the sharp edge
+-- of sweeping every session rather than only the active one, and it is invisible in a diff: prevDead is the
+-- death-edge baseline for the ACTIVE raid, and first sight re-baselines a unit WITHOUT counting it, so
+-- wiping it because some other raid's lockout rolled over would silently drop every player already on the
+-- floor here. A stranded Karazhan session decaying mid-wipe in Serpentshrine would cost Serpentshrine those
+-- deaths, with nothing printed anywhere. RefreshHUD is the same story one layer up and merely wasteful
+-- rather than harmful, the HUD only ever rendering the active session.
+local function IsActiveSession(s)
+    return s ~= nil and DB ~= nil and DB.currentRaidID ~= nil and DB.sessions[DB.currentRaidID] == s
+end
+
+-- One line per stale decay, one line for however many lockouts rolled over together. The split is the one
+-- that already shipped: a reset announces WHAT, a decay announces WHY as well, because no boss was killed
+-- and without the reason the clear reads as data loss rather than as maintenance. The BATCHING is new, and
+-- exists because a Tuesday login can now clear five raids in one pass where only the active one was ever
+-- checked before. A single rolled-over raid still prints exactly the wording it always printed.
+local function AnnounceResets(events)
+    local names = {}
+    for _, e in ipairs(events) do
+        if e.stale then
+            print(("|cff88bbffRaid Death Count|r %s was left unfinished (no boss killed) and idle over "
+                .. "%d hours: %d deaths cleared."):format(e.label, STALE_SESSION / 3600, e.cleared))
+        else
+            names[#names + 1] = e.label
+        end
+    end
+    if #names == 1 then
+        print(("|cff88bbffRaid Death Count|r new lockout for %s: counts reset."):format(names[1]))
+    elseif #names > 1 then
+        print(("|cff88bbffRaid Death Count|r new lockout: counts reset for %s.")
+            :format(table.concat(names, ", ")))
+    end
+end
+
+-- `events`, when given, collects what would have been printed instead of printing it, so a sweep can batch
+-- the whole pass into one line. Omitted, this announces immediately exactly as it always has, which is what
+-- keeps CheckActiveLockout and UpdateRaidID's two calls unchanged.
+local function CheckLockout(s, iname, events)
     if not s then return end
     -- A switched-off addon does no housekeeping either, and the gate belongs HERE rather than on
-    -- CheckActiveLockout, which is only one of three callers: UpdateRaidID reaches this directly from both
-    -- of its branches, and it runs off PLAYER_ENTERING_WORLD and GROUP_ROSTER_UPDATE, neither of which is
-    -- behind the OnUpdate gate. The decay in particular announces itself in chat, and "N deaths cleared"
-    -- arriving from something the user believes is off reads as a bug rather than as maintenance. Nothing is
+    -- CheckActiveLockout, which is only one of several callers: UpdateRaidID reaches this directly from both
+    -- of its branches and runs off PLAYER_ENTERING_WORLD and GROUP_ROSTER_UPDATE, neither of which is
+    -- behind the OnUpdate gate, and SweepLockouts reaches it once per stored session. The decay in
+    -- particular announces itself in chat, and "N deaths cleared" arriving from something the user
+    -- believes is off reads as a bug rather than as maintenance. Nothing is
     -- lost by deferring: re-enabling picks it up within a heartbeat, and a disabled client answers no
     -- resyncs, so it cannot serve the counts it skipped clearing to anybody else.
     if not Enabled() then return end
@@ -1133,16 +1312,20 @@ local function CheckLockout(s, iname)
         s.combatSeconds = 0   -- or last week's fighting stays in the denominator for the whole new week
         s.lockID, s.lockResetAt = nil, nil
         s.lastSeen = nil
-        wipe(prevDead)                    -- counts restart, so the baselines have to as well
-        RefreshHUD()
-        local label = tostring(s.instance or iname or "this raid")
-        if stale then
-            -- Says WHY as well as what, because the trigger is invisible: no boss was killed, so there was
-            -- no lockout to hang the counts on. Without that the reset reads as data loss.
-            print(("|cff88bbffRaid Death Count|r %s was left unfinished (no boss killed) and idle over "
-                .. "%d hours: %d deaths cleared."):format(label, STALE_SESSION / 3600, cleared))
-        else
-            print(("|cff88bbffRaid Death Count|r new lockout for %s: counts reset."):format(label))
+        -- Active-only, and see IsActiveSession for why: wiping the latch on behalf of a raid we are not in
+        -- would drop the deaths of anyone lying on the floor in the raid we ARE in.
+        if IsActiveSession(s) then
+            wipe(prevDead)                -- counts restart, so the baselines have to as well
+            RefreshHUD()
+        end
+        -- Silent when there was nothing to clear. The wipe above still runs, since the stamps and the
+        -- combat clock have to be re-anchored either way, but "counts reset" having reset no counts is
+        -- noise: harmless when only the active session was ever checked, and five lines of it on a Tuesday
+        -- login now that every stored raid is.
+        if cleared > 0 then
+            local ev = { label = tostring(s.instance or iname or "this raid"),
+                         cleared = cleared, stale = stale }
+            if events then events[#events + 1] = ev else AnnounceResets({ ev }) end
         end
     end
 
@@ -1157,8 +1340,52 @@ end
 -- Works from anywhere, not just inside the raid: the saved-instance list is global and the session
 -- remembers its own instance name. It has to, because a client logging in outside the raid must zero a
 -- stale session BEFORE it can answer a peer's resync with last week's counts.
+--
+-- Deliberately still ACTIVE-only, and deliberately not switched to SweepLockouts: its one remaining caller
+-- is SendFullState, which can only ever reply with the active raid's rows, so the guarantee it needs is
+-- about that session and no other. Sweeping there would be work on a latency-sensitive path for a promise
+-- the reply cannot break, and it would put a session-deleting loop inside the outbound comms path.
 function CheckActiveLockout()   -- assigns the forward-declared local up top, do not make this a new local
     CheckLockout(ActiveSession(), nil)   -- which is where the master-switch gate lives, covering all callers
+end
+
+-- Every stored session against its OWN stamp, which is the difference between "the raid I am standing in
+-- has reset" and "a new lockout has begun". It has to be per session rather than one verdict applied to
+-- all, because TBC reset periods are not uniform across raids: keying a blanket wipe off the active raid
+-- would clear a shorter-cycle raid's live counts and then miss that raid's own reset when it came. Every
+-- session already carries the server's lockID and lockResetAt, so each one answers for itself and the addon
+-- never has to know which raid resets how often.
+--
+-- Emptied non-active sessions are DELETED rather than left as shells. The Lockouts page is a within-lockout
+-- review surface and keeps no history by design, so once a raid's lockout has rolled the counts are worth
+-- nothing to anybody and a row holding no players and no combat seconds has nothing left to read. This also
+-- retires the legacy pre-0.4 "lock:" orphan for free, which could never be migrated and never decayed.
+--
+-- Three things must survive a refactor. The ACTIVE session is never deleted, because Sweep and the OnUpdate
+-- driver both reach it through DB.currentRaidID and a live raid losing its row stops counting dead with no
+-- error printed. A session with combat seconds but no deaths is NOT empty and survives, since a deathless
+-- night is a real result until its own lockout expires and the wipe zeroes the clock. And the master switch
+-- is checked here as well as inside CheckLockout, because the deletion below is housekeeping that
+-- CheckLockout's own gate does not cover.
+local function SweepLockouts()
+    if not DB or not DB.sessions then return end
+    if not Enabled() then return end
+    local events, emptied = {}, {}
+    for rid, s in pairs(DB.sessions) do
+        CheckLockout(s, nil, events)
+        if rid ~= DB.currentRaidID
+           and next(s.players or {}) == nil and (s.combatSeconds or 0) <= 0 then
+            emptied[#emptied + 1] = rid
+        end
+    end
+    -- Collected first, deleted after. Assigning nil to the key `next` is currently sitting on is legal in
+    -- Lua 5.1, but nothing here needs to lean on that to be read correctly.
+    for _, rid in ipairs(emptied) do DB.sessions[rid] = nil end
+    if #events > 0 then AnnounceResets(events) end
+    -- Guarded like every other UI call from the core, which loads first. Only on a pass that changed
+    -- something: the Lockouts page repaints on show and on resize and has no tick of its own, so a window
+    -- left open in town across a reset would otherwise keep drawing a raid this sweep just deleted.
+    if (#events > 0 or #emptied > 0) and RDC.RefreshLockouts then RDC.RefreshLockouts() end
 end
 
 -- Re-resolve the active raid; switch (fresh session + resync) only on a genuinely different raid.
@@ -1497,8 +1724,10 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         RebuildWatched()
         UpdateRaidID()
         -- Before any comms: a session left over from an expired lockout has to be zeroed now, or our
-        -- first resync reply would push last week's counts onto peers who had already reset.
-        CheckActiveLockout()
+        -- first resync reply would push last week's counts onto peers who had already reset. The full
+        -- sweep rather than the active one, because a login is where a week's worth of rolled-over raids
+        -- is most likely to be noticed all at once.
+        SweepLockouts()
         if RequestRaidInfo then RequestRaidInfo() end   -- warms the list, fires UPDATE_INSTANCE_INFO
         if RDC.InitHUD then RDC.InitHUD() end
         if RDC.InitMinimap then RDC.InitMinimap() end
@@ -1521,7 +1750,7 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         if InPvPInstance() then commsOK, commsBrokenSince, reassertCount = nil, nil, 0 end
         RebuildWatched()
         UpdateRaidID()
-        CheckActiveLockout()
+        SweepLockouts()
         if RequestRaidInfo then RequestRaidInfo() end
         RequestResync()
         AnnouncePresence()
@@ -1539,7 +1768,7 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         AnnouncePresence()
 
     elseif event == "UPDATE_INSTANCE_INFO" then
-        CheckActiveLockout()   -- the list can be cold at login; this is when it is actually trustworthy
+        SweepLockouts()   -- the list can be cold at login; this is when it is actually trustworthy
 
     elseif event == "CHAT_MSG_ADDON" then
         if arg1 == COMM_PREFIX and DB then OnComm(arg2, arg4) end
@@ -1573,8 +1802,10 @@ frame:SetScript("OnUpdate", function(_, elapsed)
             lastHeartbeat = now
             EnsurePrefix()   -- re-assert: a silently dropped registration otherwise needs a /reload
             -- Safety net for a client parked in town across the weekly reset, which would otherwise keep
-            -- last week's counts until it zoned or relogged. Converges everyone within HEARTBEAT.
-            CheckActiveLockout()
+            -- last week's counts until it zoned or relogged. Converges everyone within HEARTBEAT, and
+            -- since the sweep reaches every stored session this is also what clears the raids the
+            -- character is not standing in, with no zoning needed to reach them.
+            SweepLockouts()
             AnnouncePresence()
             -- Grouped but hearing nobody means either we are the only user here or we just went deaf and
             -- missed their broadcasts. Merge is by MAX, so a redundant resync costs one message.
@@ -1628,9 +1859,14 @@ function RDC.DebugRaid()
         -- session is never checked while it is inactive, so a high idle here is expected, not a fault:
         -- it decays at the moment re-entering that raid makes it active.
         local seen = sess.lastSeen or sess.started
-        print(("  <%s> instance=%s mapID=%s lock=%s idle=%s players=%d totalDeaths=%d%s"):format(
+        -- roster= is how a wrong mapID surfaces. A session reading "roster=NONE" for a raid that plainly IS
+        -- on the roster means neither its mapID nor its aliases matched, so the page is drawing it as a
+        -- duplicate button beside the inert roster one instead of filling that one in.
+        local r = RosterFor(sess, id)
+        print(("  <%s> instance=%s mapID=%s lock=%s idle=%s players=%d totalDeaths=%d roster=%s%s"):format(
             tostring(id), tostring(sess.instance), tostring(sess.mapID), tostring(sess.lockID),
             seen and ("%.1fh"):format((time() - seen) / 3600) or "?", np, total,
+            r and r.label or "NONE",
             id == DB.currentRaidID and "  <== ACTIVE" or ""))
     end
 end
