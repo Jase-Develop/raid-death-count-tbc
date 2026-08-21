@@ -1346,21 +1346,44 @@ do
     detail:SetPoint("TOPLEFT",     rule, "BOTTOMLEFT",  0, -8)
     detail:SetPoint("BOTTOMRIGHT", page, "BOTTOMRIGHT", -4, 0)
 
-    -- Both horizontal anchors, so its BOTTOMRIGHT is the pane's edge and the stats row below can hang off
-    -- it. A name-width FontString would drag the whole column in with it.
-    local instName = detail:CreateFontString(nil, "OVERLAY")
+    -- One line for the raid's identity: name on the left, when this lockout's counting began on the right.
+    -- Its own frame for the same reason statsRow is one, and this is the part a diff does not show: the two
+    -- FontStrings now bound each other horizontally, so anything below has to hang off the ROW. Hung off
+    -- either FontString instead, the stats row's right edge would follow the DATE's width rather than the
+    -- pane's, dragging DPM ~90px in from the edge it is meant to sit on.
+    local headRow = CreateFrame("Frame", nil, detail)
+    headRow:SetHeight(16)
+    headRow:SetPoint("TOPLEFT",  detail, "TOPLEFT",  2, 0)
+    headRow:SetPoint("TOPRIGHT", detail, "TOPRIGHT", 0, 0)
+
+    -- Dim and small, because it is context in the way the state line below is and not one of the three
+    -- figures on the stats row. Built BEFORE the name because the name is bounded against it. Empty text
+    -- has zero width, so a session with no stamp hands the whole line back to the name for free.
+    local startFS = headRow:CreateFontString(nil, "OVERLAY")
+    ApplyFont(startFS, OPT_LABEL_FS)
+    startFS:SetPoint("RIGHT", headRow, "RIGHT", -4, 0)
+    startFS:SetJustifyH("RIGHT")
+    startFS:SetTextColor(THEME.dim[1], THEME.dim[2], THEME.dim[3])
+
+    -- Keeps the UNTRIMMED name, unlike the raid buttons above, since it still has most of a line to itself.
+    -- Bounded right against the stamp with no wrap, the same treatment the HUD title got against syncTag:
+    -- a FontString with a free edge sizes to its text, so the longest name would otherwise draw straight
+    -- through the date. It does not collide at OPT_MIN_W today, which is exactly what was true of the HUD
+    -- title until it was not.
+    local instName = headRow:CreateFontString(nil, "OVERLAY")
     ApplyFont(instName, OPT_BODY_FS)
-    instName:SetPoint("TOPLEFT",  detail, "TOPLEFT",  2, 0)
-    instName:SetPoint("TOPRIGHT", detail, "TOPRIGHT", 0, 0)
+    instName:SetPoint("LEFT",  headRow, "LEFT",  0, 0)
+    instName:SetPoint("RIGHT", startFS, "LEFT",  -6, 0)
     instName:SetJustifyH("LEFT")
+    instName:SetWordWrap(false)
     instName:SetTextColor(THEME.accent[1], THEME.accent[2], THEME.accent[3])
 
     -- Deaths, clock, DPM in the stats-hud's own left/centre/right order, so the two surfaces read the same
     -- way round: the derived figure sits after both the numbers it was derived from.
     local statsRow = CreateFrame("Frame", nil, detail)
     statsRow:SetHeight(16)
-    statsRow:SetPoint("TOPLEFT",  instName, "BOTTOMLEFT",  0, -6)
-    statsRow:SetPoint("TOPRIGHT", instName, "BOTTOMRIGHT", 0, -6)
+    statsRow:SetPoint("TOPLEFT",  headRow, "BOTTOMLEFT",  0, -6)
+    statsRow:SetPoint("TOPRIGHT", headRow, "BOTTOMRIGHT", 0, -6)
 
     local deathsFS = statsRow:CreateFontString(nil, "OVERLAY")
     ApplyFont(deathsFS, OPT_BODY_FS)
@@ -1623,6 +1646,11 @@ do
         end
         if e then
             instName:SetText(e.instance or "Unknown raid")
+            -- Labelled rather than bare: a date alone beside a raid name reads just as easily as "last
+            -- played" or "resets on", and which of the three it is happens to be the one thing about this
+            -- figure worth being sure of.
+            local started = RDC.FormatStamp and RDC.FormatStamp(e.started) or ""
+            startFS:SetText(started ~= "" and ("Started " .. started) or "")
             -- All three labelled the same way. The strip on the HUD leaves the clock bare because it has a
             -- fixed left-to-right reading and no room to spare; here there is room, and an unlabelled time
             -- between two labelled figures just reads as the odd one out.

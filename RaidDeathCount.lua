@@ -336,6 +336,16 @@ function RDC.FormatDuration(sec)
     return ("%dm"):format(m)
 end
 
+-- An absolute wall-clock stamp, DD/MM/YYYY HH:MM. Beside the other formatters and for the same reason,
+-- even though the Lockouts page is its only caller today: a second surface that wants to print a date must
+-- not be free to pick its own field order. `date` is the client's os.date, so this is the LOCAL machine's
+-- clock, which is the only clock the addon has and deliberately so (see the raid timer decision: nothing
+-- here is agreed with peers, so a wrong clock misreads one player's page and cannot poison anyone else's).
+function RDC.FormatStamp(t)
+    if not t or t <= 0 then return "" end
+    return date("%d/%m/%Y %H:%M", t)
+end
+
 function RDC.GetInstanceName()
     if RDC.demoData then return "Demo Preview" end
     local s = ActiveSession()
@@ -384,6 +394,11 @@ end
 -- zero; and a legacy "lock:" key that UpdateRaidID never got to migrate shows up as a phantom second entry
 -- for an instance that already has a real one.
 --
+-- `started` is carried for the page's start time, and the wipe is what gives it its meaning: it reads as
+-- "when this lockout's counting began" and NOT "when the pull started". It is written when the session
+-- row is minted, which is the zone-in that first resolved this RaidID, and rewritten to now by every
+-- CheckLockout wipe, so a raid reset last Tuesday dates from the Tuesday you walked back in.
+--
 -- Ordered on lastSeen and NOT on started, which is what PruneSessions sorts by: the wipe sets started = now,
 -- so a raid cleared last week would otherwise sort as newer than one genuinely played since. Falls back to
 -- started for rows written before lastSeen existed, and ties break on the id so the order cannot shuffle
@@ -400,6 +415,7 @@ function RDC.GetLockouts()
                 instance      = s.instance,
                 deaths        = deaths,
                 combatSeconds = s.combatSeconds or 0,
+                started       = s.started or 0,
                 seen          = s.lastSeen or s.started or 0,
                 state         = LockoutState(s),
             }
