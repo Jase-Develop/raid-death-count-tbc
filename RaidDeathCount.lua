@@ -1884,6 +1884,37 @@ function RDC.DebugTimer()
         RDC.demoData and "  (DEMO: hud shows " .. RDC.FormatClock(DEMO_COMBAT_SECONDS) .. ")" or ""))
 end
 
+-- Every signal the death sweep could read, per group member, beside what the sweep itself concludes. Exists
+-- because a death shown as Dead on the raid frames went uncounted twice in Hyjal, with the victim far out of
+-- visibility and no other addon user to fill the gap. rdc and latch are the columns that localise a miss:
+-- rdc=alive while the unit is dead blames the API read, rdc=dead with latch=dead blames the latch (the edge
+-- was already consumed). latch only moves while Sweep runs, which is inside a raid instance, so outside one
+-- it is stale and only the API columns mean anything. Shows only rows worth reading (dead by any signal,
+-- latched, or out of visibility) since a full raid is 25 lines; pass true for everyone.
+function RDC.DebugUnits(all)
+    local shown = 0
+    for _, unit in ipairs(watched) do
+        local name = FullName(unit)
+        if name then
+            local dead, ghost = UnitIsDead(unit), UnitIsGhost(unit)
+            local feign = UnitIsFeignDeath and UnitIsFeignDeath(unit)
+            local hp, vis = UnitHealth(unit), UnitIsVisible(unit)
+            local rdc = UnitIsDeadOrGhost(unit) and not feign   -- the exact expression Sweep uses
+            local latch = prevDead[name]
+            if all or dead or ghost or feign or hp == 0 or latch or not vis then
+                shown = shown + 1
+                print(("|cff88bbffRDC|r %s (%s) rdc=%s latch=%s  dead=%s ghost=%s feign=%s hp=%s/%s conn=%s vis=%s"):format(
+                    name, unit, rdc and "DEAD" or "alive",
+                    latch == nil and "none" or (latch and "dead" or "alive"),
+                    tostring(dead), tostring(ghost), tostring(feign), tostring(hp), tostring(UnitHealthMax(unit)),
+                    tostring(UnitIsConnected(unit)), tostring(vis)))
+            end
+        end
+    end
+    print(("|cff88bbffRDC|r units: %d watched, %d shown  inRaidInstance=%s"):format(
+        #watched, shown, tostring(InRaidInstance())))
+end
+
 function RDC.DebugComms()
     -- Comms health. The echo column is the one that matters: it is the only reading that separates "we
     -- went deaf" from "nobody else here", which the sync count alone cannot do.
