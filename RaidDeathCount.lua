@@ -1642,7 +1642,7 @@ function RDC.Report(mode)
     local key = mode and mode:lower() or "all"
 
     -- Deliberately AHEAD of the empty guard below, unlike every other mode. A night with no deaths is a
-    -- result worth posting here, and the combat time next to it is what makes it one: "0 deaths in 00:42:10"
+    -- result worth posting here, and the combat time next to it is what makes it one: "0 deaths in 0:42:10"
     -- is the report a clean run wants, where the other modes genuinely have nothing to list.
     --
     -- "total" is kept as an alias rather than removed. It shipped as a documented command and may sit in
@@ -1657,8 +1657,12 @@ function RDC.Report(mode)
         -- class-and-tier ballpark (see REPAIR_COST) that must never read as anyone's actual bill.
         local repair = total > 0
             and (", approx %dg in repairs"):format(math.floor(RDC.EstimateRepair(snap) / 10000 + 0.5)) or ""
-        ReportLine(("Raid Death Count: %d death%s in %s of combat (%s deaths per min)%s"):format(
-            total, total == 1 and "" or "s", RDC.FormatClock(sec), RDC.FormatDPM(total, sec), repair))
+        -- The hours' leading zero is dropped for chat ("1:36:31"). FormatClock pads it for the strip, where a
+        -- fixed width stops the bar reflowing; a sentence has nothing to reflow, and the value is identical.
+        -- Parenthesised: gsub returns a second value that would otherwise spill into format.
+        local clock = (RDC.FormatClock(sec):gsub("^0(%d)", "%1"))
+        ReportLine(("Raid Death Count: %d death%s in %s of combat time (%s deaths per min%s)."):format(
+            total, total == 1 and "" or "s", clock, RDC.FormatDPM(total, sec), repair))
         return
     end
 
