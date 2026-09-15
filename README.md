@@ -23,7 +23,9 @@ deaths. No dependencies, no setup, no configuration to get wrong.
   how many raiders are running the addon. Hover it for details.
 - The **R** panel holds every report in one place: all, top 3, top 5, stats, fewest deaths, and a per-class
   breakdown. Pick one and it posts to chat and closes. **Stats** posts the same three figures the bar along
-  the bottom shows, as one line.
+  the bottom shows, as one line, plus a rough estimate of what those deaths cost the raid in repairs. The
+  estimate is priced by each player's class and the tier of the raid, assuming epic gear for that tier, so
+  treat it as a ballpark and not anyone's actual bill.
 - A stats bar runs along the bottom of the HUD showing the raid total, time spent in combat, and deaths per
   minute. Combat time only counts while the raid is actually fighting, so it pauses between pulls and across
   the trip back from a wipe, and DPM is measured against that same fighting time rather than against the

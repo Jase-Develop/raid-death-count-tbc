@@ -426,18 +426,60 @@ end
 -- Zul'Aman's shorter lockout needs NOTHING here or anywhere else: every reset is derived from the resetIn
 -- the server returns and stored as an absolute lockResetAt, and FormatDuration renders any span. Nothing in
 -- the addon assumes seven days. That is the whole payoff of judging each session against its own stamp.
+--
+-- `tier` is the gear tier the raid drops, and only the repair estimate reads it: it picks the REPAIR_COST row.
+-- Zul'Aman drops ilvl 138 and sits with T5; Sunwell is its own row (7) because its loot is a step above T6.
 local RAID_ROSTER = {
-    { label = "Black Temple",         mapID = 564, aliases = { "black temple" } },
-    { label = "Gruul's Lair",         mapID = 565, aliases = { "gruul's lair" } },
-    { label = "Karazhan",             mapID = 532, aliases = { "karazhan" } },
-    { label = "Magtheridon's Lair",   mapID = 544, aliases = { "magtheridon's lair" } },
-    { label = "Mount Hyjal",          mapID = 534, aliases = { "hyjal summit", "mount hyjal",
-                                                               "the battle for mount hyjal" } },
-    { label = "Serpentshrine Cavern", mapID = 548, aliases = { "serpentshrine cavern" } },
-    { label = "Sunwell Plateau",      mapID = 580, aliases = { "sunwell plateau", "the sunwell" } },
-    { label = "Tempest Keep",         mapID = 550, aliases = { "tempest keep", "the eye" } },
-    { label = "Zul'Aman",             mapID = 568, aliases = { "zul'aman", "zulaman" } },
+    { label = "Black Temple",         mapID = 564, tier = 6, aliases = { "black temple" } },
+    { label = "Gruul's Lair",         mapID = 565, tier = 4, aliases = { "gruul's lair" } },
+    { label = "Karazhan",             mapID = 532, tier = 4, aliases = { "karazhan" } },
+    { label = "Magtheridon's Lair",   mapID = 544, tier = 4, aliases = { "magtheridon's lair" } },
+    { label = "Mount Hyjal",          mapID = 534, tier = 6, aliases = { "hyjal summit", "mount hyjal",
+                                                                         "the battle for mount hyjal" } },
+    { label = "Serpentshrine Cavern", mapID = 548, tier = 5, aliases = { "serpentshrine cavern" } },
+    { label = "Sunwell Plateau",      mapID = 580, tier = 7, aliases = { "sunwell plateau", "the sunwell" } },
+    { label = "Tempest Keep",         mapID = 550, tier = 5, aliases = { "tempest keep", "the eye" } },
+    { label = "Zul'Aman",             mapID = 568, tier = 5, aliases = { "zul'aman", "zulaman" } },
 }
+
+-- Approximate repair cost of ONE death, in copper, by gear tier then class. A ballpark for "/rdc report
+-- stats" and nothing more: it assumes every raider wears epics at the level the raid drops, so an
+-- undergeared raider in blues is overestimated by up to 2x (rare items repair at half the epic rate).
+--
+-- Generated 2026-09-15, not hand-tuned. The server's repair formula (per the CMaNGOS TBC source) is
+-- lost points x DurabilityCosts[itemLevel][subclass] x DurabilityQuality[(quality + 1) * 2], and a death
+-- takes floor(10% of max) points from every equipped item. That was run over the 2.5.6.69795 client tables
+-- (wago.tools: DurabilityCosts, DurabilityQuality, ItemSparse, Item), taking the median epic per armor slot
+-- and per weapon type inside each tier's item level band (T4 115-125, T5 128-141, T6 141-156, 7 = Sunwell
+-- 154-164). The per-point multiplier is the SAME for cloth, leather, mail and plate; armor type matters
+-- only because heavier armor carries more max durability (a plate chest 165, a cloth one 100). Cloaks,
+-- jewellery, trinkets, relics and held-in-off-hand items have no durability and cost nothing.
+--
+-- The weapon loadout per class is an average of its common specs: warrior 2H / dual wield / 1H+shield plus
+-- a ranged slot, paladin 2H / 1H+shield, hunter 2H / dual wield plus ranged, shaman 1H+shield / dual wield,
+-- rogue dual wield plus ranged, druid 2H, and the cloth classes a wand plus staff / 1H.
+--
+-- NOT yet calibrated in game. The formula comes from an emulator, not Blizzard, so before trusting it: stand
+-- at a vendor fully repaired, die once, and compare the repair cost against your class and tier here.
+-- Reputation discounts, spirit-healer resurrection and durability lost to combat hits are all out of scope
+-- by design: this prices the deaths RDC counted and nothing else.
+local REPAIR_COST = {
+    [4] = { WARRIOR = 43200, PALADIN = 39500, HUNTER = 39400, SHAMAN = 36100, ROGUE = 35600,
+            DRUID   = 31700, MAGE    = 27500, PRIEST = 27500, WARLOCK = 27500 },
+    [5] = { WARRIOR = 50300, PALADIN = 45800, HUNTER = 46300, SHAMAN = 42800, ROGUE = 42200,
+            DRUID   = 36800, MAGE    = 32400, PRIEST = 32400, WARLOCK = 32400 },
+    [6] = { WARRIOR = 56300, PALADIN = 51100, HUNTER = 51200, SHAMAN = 46900, ROGUE = 46400,
+            DRUID   = 40400, MAGE    = 35800, PRIEST = 35800, WARLOCK = 35800 },
+    [7] = { WARRIOR = 61900, PALADIN = 56400, HUNTER = 56200, SHAMAN = 52100, ROGUE = 51200,
+            DRUID   = 44400, MAGE    = 39300, PRIEST = 39300, WARLOCK = 39300 },
+}
+-- A stored class can be "" for a player only ever heard about over comms, so each tier also carries the
+-- mean of its nine classes to price that row. Computed rather than typed so it cannot drift from the table.
+for _, row in pairs(REPAIR_COST) do
+    local sum, n = 0, 0
+    for _, c in pairs(row) do sum, n = sum + c, n + 1 end
+    row.average = math.floor(sum / n)
+end
 
 -- Strips a cluster prefix and nothing else, mirroring the UI's InstanceLabel so a roster miss still reads
 -- the way the rest of the addon names a raid. The same shape FindLockout already uses for its tail match.
@@ -466,6 +508,20 @@ local function RosterFor(s, rid)
         end
     end
     return nil
+end
+
+-- Approximate copper the counted deaths cost in repairs, priced per row by class at the ACTIVE raid's tier.
+-- Every input is already synced (counts and class) or a constant (the table), so every client prints the
+-- same figure with nothing new on the wire. A raid the roster cannot place is priced at T5, the middle row,
+-- rather than refused: a missing estimate on a fun line is worse than a rough one.
+function RDC.EstimateRepair(snap)
+    local r = RosterFor(ActiveSession(), DB and DB.currentRaidID)
+    local row = REPAIR_COST[(r and r.tier) or 5]
+    local copper = 0
+    for _, e in ipairs(snap or RDC.GetSnapshot()) do
+        copper = copper + e.deaths * (row[e.class or ""] or row.average)
+    end
+    return copper
 end
 
 -- One entry per ROSTER raid, plus any stored raid the roster did not claim, in alphabetical order.
@@ -1596,8 +1652,13 @@ function RDC.Report(mode)
     if key == "stats" or key == "total" then
         local total = RDC.TotalDeaths(snap)
         local sec   = RDC.GetCombatSeconds()
-        ReportLine(("Raid Death Count: %d death%s in %s of combat (%s deaths per min)"):format(
-            total, total == 1 and "" or "s", RDC.FormatClock(sec), RDC.FormatDPM(total, sec)))
+        -- The repair figure is left off a deathless night rather than printed as ~0g, which only adds noise
+        -- to the clean-run line. Rounded to whole gold, and marked approximate in the text, because it is a
+        -- class-and-tier ballpark (see REPAIR_COST) that must never read as anyone's actual bill.
+        local repair = total > 0
+            and (", approx %dg in repairs"):format(math.floor(RDC.EstimateRepair(snap) / 10000 + 0.5)) or ""
+        ReportLine(("Raid Death Count: %d death%s in %s of combat (%s deaths per min)%s"):format(
+            total, total == 1 and "" or "s", RDC.FormatClock(sec), RDC.FormatDPM(total, sec), repair))
         return
     end
 
